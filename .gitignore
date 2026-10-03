@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+
+# Temporary, media and download files
+*.download
+*.tmp
+_ws_vtemp_*
+_ws_atemp_*
+samples/*.mp4
+samples/*.avi
+*.mp4
+*.avi
+
+# Local configs / logs
+*.log
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Binaries (distributed via Releases)
+bin/
+
+# Linux cross-compilation (not for GitHub)
+scripts/build_cross_linux.sh
+
+# CLI module (not for GitHub)
+src/cli.py
+
+# Samples
+samples/
+
+# OS generated
+.DS_Store
+Thumbs.db
