@@ -6,6 +6,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <urlmon.h>
+#include <wininet.h>
 #include <gdiplus.h>
 #include <string>
 #include <vector>
@@ -38,11 +39,20 @@ using std::max;
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "wininet.lib")
 
 using namespace Gdiplus;
 
+// Версия и ссылки
+const std::wstring APP_VERSION = L"1.1.0";
+const std::wstring GITHUB_REPO_URL = L"https://github.com/Hikerys/WinScreen";
+const std::wstring GITHUB_API_LATEST_RELEASE = L"https://api.github.com/repos/Hikerys/WinScreen/releases/latest";
+
 // Константы приложения
 #define WM_TRAYICON (WM_USER + 1)
+#define WM_UPDATE_CHECK_DONE (WM_USER + 50)
 #define ID_TRAY_FULLSCREEN     2001
 #define ID_TRAY_LIVE_AREA      2002
 #define ID_TRAY_FROZEN_AREA    2003
@@ -193,6 +203,7 @@ std::wstring FormatHotkey(DWORD vk, bool ctrl, bool shift, bool alt, bool win = 
 
 // Структура для выделения области
 struct SelectionState {
+    bool isMouseDown = false;
     bool isSelecting = false;
     POINT startPt = { 0, 0 };
     POINT currentPt = { 0, 0 };
@@ -205,6 +216,11 @@ struct SelectionState {
     int screenW = 0;
     int screenH = 0;
     HWND hOverlayWnd = NULL;
+
+    // Подсветка и захват окна под курсором
+    HWND hoveredWnd = NULL;
+    RECT hoveredRect = { 0, 0, 0, 0 }; // в координатах оверлея
+    POINT lastMouseMovePt = { -1, -1 };
 } g_sel;
 
 // Прототипы
@@ -593,9 +609,112 @@ void TriggerFullScreenCapture() {
     ProcessCapturedBitmap(hBmp);
 }
 
+// Функция поиска верхнего видимого окна под курсором для захвата окон
+typedef HRESULT (WINAPI *pfnDwmGetWindowAttribute)(HWND, DWORD, PVOID, DWORD);
+
+struct WindowFindContext {
+    POINT pt;
+    HWND hOverlayWnd;
+    HWND hFoundWnd;
+    RECT rcFound;
+};
+
+static BOOL CALLBACK EnumWindowsFindProc(HWND hWnd, LPARAM lParam) {
+    WindowFindContext* ctx = (WindowFindContext*)lParam;
+
+    // Игнорируем окно оверлея
+    if (ctx->hOverlayWnd && hWnd == ctx->hOverlayWnd) return TRUE;
+
+    // Игнорируем рабочий стол и системный shell
+    if (hWnd == GetDesktopWindow() || hWnd == GetShellWindow()) return TRUE;
+
+    // Окно должно быть видимым и не свернутым
+    if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return TRUE;
+
+    // Пропускаем прозрачные для мыши окна
+    LONG exStyle = GetWindowLongW(hWnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TRANSPARENT) return TRUE;
+
+    // Игнорируем классы рабочего стола Windows (Progman, WorkerW)
+    wchar_t clsName[64];
+    if (GetClassNameW(hWnd, clsName, 64)) {
+        if (wcscmp(clsName, L"Progman") == 0 || wcscmp(clsName, L"WorkerW") == 0) {
+            return TRUE;
+        }
+    }
+
+    // Проверяем cloaked-статус (скрытые или приостановленные UWP приложения в Windows 10/11)
+    static pfnDwmGetWindowAttribute s_pDwmGetWindowAttribute = NULL;
+    static bool s_dwChecked = false;
+    if (!s_dwChecked) {
+        HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+        if (!hDwm) hDwm = LoadLibraryW(L"dwmapi.dll");
+        if (hDwm) {
+            s_pDwmGetWindowAttribute = (pfnDwmGetWindowAttribute)GetProcAddress(hDwm, "DwmGetWindowAttribute");
+        }
+        s_dwChecked = true;
+    }
+
+    if (s_pDwmGetWindowAttribute) {
+        int cloaked = 0;
+        if (SUCCEEDED(s_pDwmGetWindowAttribute(hWnd, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof(cloaked))) && cloaked != 0) {
+            return TRUE;
+        }
+    }
+
+    // Получаем реальные видимые границы окна (без невидимой тени DWM)
+    RECT rc = { 0, 0, 0, 0 };
+    HRESULT hr = E_FAIL;
+    if (s_pDwmGetWindowAttribute) {
+        hr = s_pDwmGetWindowAttribute(hWnd, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, &rc, sizeof(rc));
+    }
+    if (FAILED(hr)) {
+        GetWindowRect(hWnd, &rc);
+    }
+
+    // Если окно распахнуто на весь экран (maximized), обрезаем его по границам соответствующего монитора
+    if (IsZoomed(hWnd)) {
+        HMONITOR hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+        if (hMon) {
+            MONITORINFO mi = { sizeof(MONITORINFO) };
+            if (GetMonitorInfoW(hMon, &mi)) {
+                IntersectRect(&rc, &rc, &mi.rcMonitor);
+            }
+        }
+    }
+
+    // Игнорируем невидимые или служебные нулевые окна
+    if (rc.right - rc.left <= 10 || rc.bottom - rc.top <= 10) return TRUE;
+
+    // Проверяем попадание курсора внутрь окна
+    if (PtInRect(&rc, ctx->pt)) {
+        ctx->hFoundWnd = hWnd;
+        ctx->rcFound = rc;
+        return FALSE; // Найдено верхнее видимое окно по Z-order! Останавливаем перебор.
+    }
+
+    return TRUE;
+}
+
+static void FindTopLevelWindowUnderPoint(POINT pt, HWND hOverlayWnd, HWND* outWnd, RECT* outRect) {
+    WindowFindContext ctx;
+    ctx.pt = pt;
+    ctx.hOverlayWnd = hOverlayWnd;
+    ctx.hFoundWnd = NULL;
+    ctx.rcFound = { 0, 0, 0, 0 };
+
+    EnumWindows(EnumWindowsFindProc, (LPARAM)&ctx);
+
+    if (outWnd) *outWnd = ctx.hFoundWnd;
+    if (outRect) *outRect = ctx.rcFound;
+}
+
 // Оконная процедура оверлея
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
@@ -606,8 +725,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             SelectObject(hMemDC, g_sel.hDimmedBmp);
             BitBlt(hdc, 0, 0, g_sel.screenW, g_sel.screenH, hMemDC, 0, 0, SRCCOPY);
 
-            // Если выделена область, вырезаем яркий исходный кадр внутри рамки
             if (g_sel.isSelecting) {
+                // Пользователь тянет рамку вручную: яркий исходный кадр внутри рамки
                 int x1 = min(g_sel.startPt.x, g_sel.currentPt.x);
                 int y1 = min(g_sel.startPt.y, g_sel.currentPt.y);
                 int x2 = max(g_sel.startPt.x, g_sel.currentPt.x);
@@ -619,7 +738,29 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     SelectObject(hMemDC, g_sel.hOriginalBmp);
                     BitBlt(hdc, x1, y1, rw, rh, hMemDC, x1, y1, SRCCOPY);
 
-                    // Чистая неоновая рамка (строгий минимализм, без лишних цифр и луп)
+                    // Чистая неоновая рамка
+                    HPEN hPen = CreatePen(PS_SOLID, 2, RGB(0, 229, 255));
+                    HGDIOBJ hOldPen = SelectObject(hdc, hPen);
+                    HGDIOBJ hOldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                    Rectangle(hdc, x1, y1, x2, y2);
+                    SelectObject(hdc, hOldBrush);
+                    SelectObject(hdc, hOldPen);
+                    DeleteObject(hPen);
+                }
+            } else if (g_sel.hoveredWnd) {
+                // Наведение на окно: окно подсвечивается ярким кадром и неоновой рамкой
+                int x1 = g_sel.hoveredRect.left;
+                int y1 = g_sel.hoveredRect.top;
+                int x2 = g_sel.hoveredRect.right;
+                int y2 = g_sel.hoveredRect.bottom;
+                int rw = x2 - x1;
+                int rh = y2 - y1;
+
+                if (rw > 0 && rh > 0 && g_sel.hOriginalBmp) {
+                    SelectObject(hMemDC, g_sel.hOriginalBmp);
+                    BitBlt(hdc, x1, y1, rw, rh, hMemDC, x1, y1, SRCCOPY);
+
+                    // Чистая неоновая рамка окна
                     HPEN hPen = CreatePen(PS_SOLID, 2, RGB(0, 229, 255));
                     HGDIOBJ hOldPen = SelectObject(hdc, hPen);
                     HGDIOBJ hOldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -630,12 +771,35 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
         } else if (!g_sel.isFrozen) {
-            // В живом режиме: рисуем аккуратную рамку
+            // В живом режиме (слоистое полупрозрачное окно WS_EX_LAYERED):
+            // Очищаем область перерисовки черным цветом (базовый слой прозрачности)
+            FillRect(hdc, &ps.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
             if (g_sel.isSelecting) {
                 int x1 = min(g_sel.startPt.x, g_sel.currentPt.x);
                 int y1 = min(g_sel.startPt.y, g_sel.currentPt.y);
                 int x2 = max(g_sel.startPt.x, g_sel.currentPt.x);
                 int y2 = max(g_sel.startPt.y, g_sel.currentPt.y);
+                HPEN hPen = CreatePen(PS_SOLID, 2, RGB(0, 210, 255));
+                HGDIOBJ hOldPen = SelectObject(hdc, hPen);
+                HGDIOBJ hOldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, x1, y1, x2, y2);
+                SelectObject(hdc, hOldBrush);
+                SelectObject(hdc, hOldPen);
+                DeleteObject(hPen);
+            } else if (g_sel.hoveredWnd) {
+                int x1 = g_sel.hoveredRect.left;
+                int y1 = g_sel.hoveredRect.top;
+                int x2 = g_sel.hoveredRect.right;
+                int y2 = g_sel.hoveredRect.bottom;
+
+                // Легкая полупрозрачная подсветка окна
+                HBRUSH hFillBrush = CreateSolidBrush(RGB(0, 90, 140));
+                RECT rcFill = { x1, y1, x2, y2 };
+                FillRect(hdc, &rcFill, hFillBrush);
+                DeleteObject(hFillBrush);
+
+                // Неоновая рамка окна
                 HPEN hPen = CreatePen(PS_SOLID, 2, RGB(0, 210, 255));
                 HGDIOBJ hOldPen = SelectObject(hdc, hPen);
                 HGDIOBJ hOldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -651,7 +815,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_LBUTTONDOWN: {
-        g_sel.isSelecting = true;
+        g_sel.isMouseDown = true;
+        g_sel.isSelecting = false;
         g_sel.startPt.x = GET_X_LPARAM(lParam);
         g_sel.startPt.y = GET_Y_LPARAM(lParam);
         g_sel.currentPt = g_sel.startPt;
@@ -659,35 +824,103 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_MOUSEMOVE: {
-        if (g_sel.isSelecting) {
-            g_sel.currentPt.x = GET_X_LPARAM(lParam);
-            g_sel.currentPt.y = GET_Y_LPARAM(lParam);
-            InvalidateRect(hWnd, NULL, FALSE);
+        int curX = GET_X_LPARAM(lParam);
+        int curY = GET_Y_LPARAM(lParam);
+
+        if (g_sel.isMouseDown) {
+            // Кнопка зажата: проверяем порог начала ручного выделения (drag threshold)
+            if (!g_sel.isSelecting) {
+                int dragX = GetSystemMetrics(SM_CXDRAG);
+                int dragY = GetSystemMetrics(SM_CYDRAG);
+                if (dragX < 4) dragX = 4;
+                if (dragY < 4) dragY = 4;
+
+                if (abs(curX - g_sel.startPt.x) >= dragX || abs(curY - g_sel.startPt.y) >= dragY) {
+                    g_sel.isSelecting = true;
+                    g_sel.hoveredWnd = NULL; // Ручное выделение отменяет захват окна
+                }
+            }
+
+            if (g_sel.isSelecting) {
+                g_sel.currentPt.x = curX;
+                g_sel.currentPt.y = curY;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+        } else {
+            // Кнопка НЕ зажата: режим наведения на окно
+            if (curX != g_sel.lastMouseMovePt.x || curY != g_sel.lastMouseMovePt.y) {
+                g_sel.lastMouseMovePt.x = curX;
+                g_sel.lastMouseMovePt.y = curY;
+
+                POINT ptScreen = { curX + g_sel.screenX, curY + g_sel.screenY };
+                HWND hFound = NULL;
+                RECT rcScreen = { 0, 0, 0, 0 };
+                FindTopLevelWindowUnderPoint(ptScreen, hWnd, &hFound, &rcScreen);
+
+                RECT rcOverlay = { 0, 0, 0, 0 };
+                if (hFound) {
+                    int x1 = max(0, (int)rcScreen.left - g_sel.screenX);
+                    int y1 = max(0, (int)rcScreen.top - g_sel.screenY);
+                    int x2 = min(g_sel.screenW, (int)rcScreen.right - g_sel.screenX);
+                    int y2 = min(g_sel.screenH, (int)rcScreen.bottom - g_sel.screenY);
+                    if (x2 > x1 && y2 > y1) {
+                        rcOverlay.left = x1;
+                        rcOverlay.top = y1;
+                        rcOverlay.right = x2;
+                        rcOverlay.bottom = y2;
+                    } else {
+                        hFound = NULL;
+                    }
+                }
+
+                if (hFound != g_sel.hoveredWnd || !EqualRect(&rcOverlay, &g_sel.hoveredRect)) {
+                    g_sel.hoveredWnd = hFound;
+                    g_sel.hoveredRect = rcOverlay;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+            }
         }
         return 0;
     }
     case WM_LBUTTONUP: {
-        if (!g_sel.isSelecting) return 0;
+        if (!g_sel.isMouseDown) return 0;
         ReleaseCapture();
-        g_sel.isSelecting = false;
+        g_sel.isMouseDown = false;
 
-        int x1 = min(g_sel.startPt.x, g_sel.currentPt.x);
-        int y1 = min(g_sel.startPt.y, g_sel.currentPt.y);
-        int x2 = max(g_sel.startPt.x, g_sel.currentPt.x);
-        int y2 = max(g_sel.startPt.y, g_sel.currentPt.y);
-        int rw = x2 - x1;
-        int rh = y2 - y1;
+        int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+        bool validCapture = false;
 
-        DestroyWindow(hWnd);
+        if (g_sel.isSelecting) {
+            // Пользователь самостоятельно выделил прямоугольную область
+            g_sel.isSelecting = false;
+            x1 = min(g_sel.startPt.x, g_sel.currentPt.x);
+            y1 = min(g_sel.startPt.y, g_sel.currentPt.y);
+            x2 = max(g_sel.startPt.x, g_sel.currentPt.x);
+            y2 = max(g_sel.startPt.y, g_sel.currentPt.y);
+            if ((x2 - x1 >= 5) && (y2 - y1 >= 5)) {
+                validCapture = true;
+            }
+        } else if (g_sel.hoveredWnd && (g_sel.hoveredRect.right > g_sel.hoveredRect.left) && (g_sel.hoveredRect.bottom > g_sel.hoveredRect.top)) {
+            // Простое нажатие на подсвеченное окно
+            x1 = g_sel.hoveredRect.left;
+            y1 = g_sel.hoveredRect.top;
+            x2 = g_sel.hoveredRect.right;
+            y2 = g_sel.hoveredRect.bottom;
+            validCapture = true;
+        }
 
-        if (rw < 5 || rh < 5) {
+        if (!validCapture) {
+            DestroyWindow(hWnd);
             ShowNotification(L"Снимок отменён", L"Выделение области прервано");
             return 0;
         }
 
+        int rw = x2 - x1;
+        int rh = y2 - y1;
+
         HBITMAP hCrop = NULL;
         if (g_sel.isFrozen && g_sel.hOriginalBmp) {
-            // Вырезаем фрагмент из замороженного в памяти стоп-кадра
+            // Вырезаем фрагмент из замороженного в памяти стоп-кадра ДО уничтожения оверлея
             HDC hScreenDC = GetDC(NULL);
             HDC hSrcDC = CreateCompatibleDC(hScreenDC);
             HDC hDstDC = CreateCompatibleDC(hScreenDC);
@@ -702,8 +935,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DeleteDC(hDstDC);
             DeleteDC(hSrcDC);
             ReleaseDC(NULL, hScreenDC);
+
+            DestroyWindow(hWnd);
         } else {
-            // Захватываем живую область экрана
+            // Захватываем живую область экрана: сначала скрываем оверлей
+            DestroyWindow(hWnd);
             Sleep(25); // даем оверлею скрыться
             int absX = g_sel.screenX + x1;
             int absY = g_sel.screenY + y1;
@@ -726,7 +962,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_KEYDOWN: {
         if (msg == WM_RBUTTONDOWN || wParam == VK_ESCAPE) {
             ReleaseCapture();
+            g_sel.isMouseDown = false;
             g_sel.isSelecting = false;
+            g_sel.hoveredWnd = NULL;
             DestroyWindow(hWnd);
             ShowNotification(L"Снимок отменён", L"Выделение области прервано");
         }
@@ -742,6 +980,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_sel.hDimmedBmp = NULL;
         }
         g_sel.hOverlayWnd = NULL;
+        g_sel.hoveredWnd = NULL;
+        g_sel.isMouseDown = false;
+        g_sel.isSelecting = false;
         return 0;
     }
     }
@@ -753,7 +994,11 @@ void StartOverlay(bool isFrozen) {
     if (g_sel.hOverlayWnd && IsWindow(g_sel.hOverlayWnd)) return;
 
     g_sel.isFrozen = isFrozen;
+    g_sel.isMouseDown = false;
     g_sel.isSelecting = false;
+    g_sel.hoveredWnd = NULL;
+    g_sel.hoveredRect = { 0, 0, 0, 0 };
+    g_sel.lastMouseMovePt = { -1, -1 };
     g_sel.screenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
     g_sel.screenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
     g_sel.screenW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -775,6 +1020,25 @@ void StartOverlay(bool isFrozen) {
     DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
     if (!isFrozen) {
         exStyle |= WS_EX_LAYERED;
+    }
+
+    // Определяем окно под курсором сразу при вызове оверлея
+    POINT ptCursor;
+    if (GetCursorPos(&ptCursor)) {
+        HWND hFound = NULL;
+        RECT rcScreen = { 0, 0, 0, 0 };
+        FindTopLevelWindowUnderPoint(ptCursor, NULL, &hFound, &rcScreen);
+        if (hFound) {
+            int x1 = max(0, (int)rcScreen.left - g_sel.screenX);
+            int y1 = max(0, (int)rcScreen.top - g_sel.screenY);
+            int x2 = min(g_sel.screenW, (int)rcScreen.right - g_sel.screenX);
+            int y2 = min(g_sel.screenH, (int)rcScreen.bottom - g_sel.screenY);
+            if (x2 > x1 && y2 > y1) {
+                g_sel.hoveredWnd = hFound;
+                g_sel.hoveredRect = { x1, y1, x2, y2 };
+            }
+        }
+        g_sel.lastMouseMovePt = { ptCursor.x - g_sel.screenX, ptCursor.y - g_sel.screenY };
     }
 
     g_sel.hOverlayWnd = CreateWindowExW(
@@ -1786,6 +2050,147 @@ void ShowTrayMenu(HWND hWnd) {
     DestroyMenu(hMenu);
 }
 
+// Преобразование UTF-8 std::string в std::wstring
+inline std::wstring Utf8ToWide(const std::string& str) {
+    if (str.empty()) return L"";
+    int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.length(), NULL, 0);
+    if (sizeNeeded <= 0) return L"";
+    std::wstring wstr(sizeNeeded, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.length(), &wstr[0], sizeNeeded);
+    return wstr;
+}
+
+// Структура и логика проверки обновлений
+struct UpdateInfo {
+    bool hasUpdate = false;
+    std::wstring latestVersion = L"";
+    std::wstring releaseUrl = L"";
+    std::wstring downloadUrl = L"";
+};
+
+static UpdateInfo g_updateInfo;
+static std::mutex g_updateMutex;
+
+struct Version {
+    int major = 0;
+    int minor = 0;
+    int patch = 0;
+};
+
+static Version ParseVersion(const std::wstring& str) {
+    Version v;
+    std::wstring s = str;
+    while (!s.empty() && (s[0] == L'v' || s[0] == L'V' || s[0] == L' ')) {
+        s = s.substr(1);
+    }
+    int parts[3] = { 0, 0, 0 };
+    int idx = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.length() && idx < 3; ++i) {
+        if (i == s.length() || s[i] == L'.') {
+            if (i > start) {
+                try {
+                    parts[idx] = std::stoi(s.substr(start, i - start));
+                } catch (...) {
+                    parts[idx] = 0;
+                }
+            }
+            idx++;
+            start = i + 1;
+        }
+    }
+    v.major = parts[0];
+    v.minor = parts[1];
+    v.patch = parts[2];
+    return v;
+}
+
+static bool IsNewerVersion(const std::wstring& remoteStr, const std::wstring& currentStr) {
+    Version r = ParseVersion(remoteStr);
+    Version c = ParseVersion(currentStr);
+    if (r.major != c.major) return r.major > c.major;
+    if (r.minor != c.minor) return r.minor > c.minor;
+    return r.patch > c.patch;
+}
+
+static std::wstring ExtractJsonString(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return L"";
+    pos += needle.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) {
+        pos++;
+    }
+    if (pos < json.length() && json[pos] == '\"') {
+        pos++;
+        size_t endPos = json.find('\"', pos);
+        if (endPos != std::string::npos) {
+            std::string val = json.substr(pos, endPos - pos);
+            return Utf8ToWide(val);
+        }
+    }
+    return L"";
+}
+
+static std::wstring ExtractExeDownloadUrl(const std::string& json) {
+    std::string needle = "\"browser_download_url\"";
+    size_t pos = 0;
+    while ((pos = json.find(needle, pos)) != std::string::npos) {
+        pos += needle.length();
+        while (pos < json.length() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) {
+            pos++;
+        }
+        if (pos < json.length() && json[pos] == '\"') {
+            pos++;
+            size_t endPos = json.find('\"', pos);
+            if (endPos != std::string::npos) {
+                std::string url = json.substr(pos, endPos - pos);
+                if (url.find(".exe") != std::string::npos) {
+                    return Utf8ToWide(url);
+                }
+                pos = endPos + 1;
+            }
+        }
+    }
+    return L"";
+}
+
+static bool CheckForUpdates(UpdateInfo& outInfo) {
+    HINTERNET hInternet = InternetOpenW(L"WinScreen-UpdateChecker", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hInternet) return false;
+
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE;
+    HINTERNET hUrl = InternetOpenUrlW(hInternet, GITHUB_API_LATEST_RELEASE.c_str(), NULL, 0, flags, 0);
+    if (!hUrl) {
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    std::string json;
+    char buf[4096];
+    DWORD bytesRead = 0;
+    while (InternetReadFile(hUrl, buf, sizeof(buf), &bytesRead) && bytesRead > 0) {
+        json.append(buf, bytesRead);
+    }
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hInternet);
+
+    if (json.empty()) return false;
+
+    std::wstring tagName = ExtractJsonString(json, "tag_name");
+    std::wstring htmlUrl = ExtractJsonString(json, "html_url");
+    std::wstring downloadUrl = ExtractExeDownloadUrl(json);
+
+    if (tagName.empty()) return false;
+
+    outInfo.latestVersion = tagName;
+    outInfo.releaseUrl = htmlUrl.empty() ? (GITHUB_REPO_URL + L"/releases/latest") : htmlUrl;
+    outInfo.downloadUrl = downloadUrl.empty() ? (GITHUB_REPO_URL + L"/releases/download/" + tagName + L"/WinScreen.exe") : downloadUrl;
+    outInfo.hasUpdate = IsNewerVersion(tagName, APP_VERSION);
+
+    return true;
+}
+
 // Окно настроек (нативный Win32 диалог)
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hChkPng = NULL;
@@ -1802,9 +2207,21 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     static HWND hChkMic = NULL;
     static HWND hLblMicChoice = NULL;
     static HWND hComboMic = NULL;
+    static HWND s_hLblVersion = NULL;
+    static HWND s_hBtnGitHub = NULL;
+    static HWND s_hBtnUpdate = NULL;
     static std::vector<std::wstring> s_detectedMics;
 
     switch (msg) {
+    case WM_UPDATE_CHECK_DONE: {
+        std::lock_guard<std::mutex> lock(g_updateMutex);
+        if (g_updateInfo.hasUpdate && s_hBtnUpdate && IsWindow(s_hBtnUpdate)) {
+            std::wstring btnText = L"🚀 Обновить (" + g_updateInfo.latestVersion + L")";
+            SetWindowTextW(s_hBtnUpdate, btnText.c_str());
+            ShowWindow(s_hBtnUpdate, SW_SHOW);
+        }
+        return 0;
+    }
     case WM_HSCROLL: {
         if ((HWND)lParam == hSliderQuality) {
             int pos = (int)SendMessageW(hSliderQuality, TBM_GETPOS, 0, 0);
@@ -1981,6 +2398,39 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         HWND btnSave = CreateWindowW(L"BUTTON", L"Сохранить", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 385, 465, 115, 28, hWnd, (HMENU)102, g_hInstance, NULL);
         SendMessageW(btnSave, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // 8. Подвал: версия, кнопка обновления и переход на GitHub
+        s_hLblVersion = CreateWindowW(L"STATIC", (L"WinScreen v" + APP_VERSION).c_str(), WS_CHILD | WS_VISIBLE, 20, 508, 140, 20, hWnd, NULL, g_hInstance, NULL);
+        SendMessageW(s_hLblVersion, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        s_hBtnUpdate = CreateWindowW(L"BUTTON", L"🚀 Обновить", WS_CHILD, 165, 503, 180, 26, hWnd, (HMENU)113, g_hInstance, NULL);
+        SendMessageW(s_hBtnUpdate, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        s_hBtnGitHub = CreateWindowW(L"BUTTON", L"GitHub", WS_CHILD | WS_VISIBLE, 415, 503, 85, 26, hWnd, (HMENU)112, g_hInstance, NULL);
+        SendMessageW(s_hBtnGitHub, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // Проверяем, было ли уже обнаружено обновление
+        {
+            std::lock_guard<std::mutex> lock(g_updateMutex);
+            if (g_updateInfo.hasUpdate) {
+                std::wstring btnText = L"🚀 Обновить (" + g_updateInfo.latestVersion + L")";
+                SetWindowTextW(s_hBtnUpdate, btnText.c_str());
+                ShowWindow(s_hBtnUpdate, SW_SHOW);
+            }
+        }
+
+        // Запуск проверки обновлений в фоновом потоке
+        std::thread([hWnd]() {
+            UpdateInfo info;
+            if (CheckForUpdates(info)) {
+                std::lock_guard<std::mutex> lock(g_updateMutex);
+                g_updateInfo = info;
+                if (IsWindow(hWnd)) {
+                    PostMessageW(hWnd, WM_UPDATE_CHECK_DONE, 0, 0);
+                }
+            }
+        }).detach();
+
         return 0;
     }
     case WM_COMMAND: {
@@ -2109,6 +2559,84 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (MessageBoxW(hWnd, L"Вы уверены, что хотите удалить WinScreen из автозагрузки?", L"Удаление WinScreen", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 UninstallApp();
             }
+        } else if (id == 112) { // Кнопка GitHub
+            ShellExecuteW(NULL, L"open", GITHUB_REPO_URL.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        } else if (id == 113) { // Кнопка Обновить
+            std::wstring latestVer, relUrl, dlUrl;
+            {
+                std::lock_guard<std::mutex> lock(g_updateMutex);
+                latestVer = g_updateInfo.latestVersion;
+                relUrl = g_updateInfo.releaseUrl;
+                dlUrl = g_updateInfo.downloadUrl;
+            }
+
+            std::wstring msg = L"Доступна новая версия " + (latestVer.empty() ? L"" : latestVer) + L"!\n\n"
+                               L"Нажмите «Да», чтобы обновить приложение автоматически без переустановки.\n"
+                               L"Нажмите «Нет», чтобы перейти на страницу релиза на GitHub.\n"
+                               L"Нажмите «Отмена», чтобы закрыть окно.";
+
+            int choice = MessageBoxW(hWnd, msg.c_str(), L"Обновление WinScreen", MB_YESNOCANCEL | MB_ICONQUESTION);
+            if (choice == IDNO) {
+                ShellExecuteW(NULL, L"open", relUrl.empty() ? GITHUB_REPO_URL.c_str() : relUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            } else if (choice == IDYES) {
+                EnableWindow(s_hBtnUpdate, FALSE);
+                SetWindowTextW(s_hBtnUpdate, L"⏳ Загрузка обновления...");
+
+                std::thread([hWnd, dlUrl, relUrl]() {
+                    WCHAR currentExe[MAX_PATH];
+                    GetModuleFileNameW(NULL, currentExe, MAX_PATH);
+
+                    WCHAR tempDir[MAX_PATH];
+                    GetTempPathW(MAX_PATH, tempDir);
+                    std::wstring tempNewExe = std::wstring(tempDir) + L"WinScreen_update.exe";
+                    std::wstring tempBat = std::wstring(tempDir) + L"winscreen_updater.bat";
+
+                    DeleteFileW(tempNewExe.c_str());
+                    HRESULT hr = URLDownloadToFileW(NULL, dlUrl.c_str(), tempNewExe.c_str(), 0, NULL);
+                    if (FAILED(hr)) {
+                        if (IsWindow(hWnd)) {
+                            EnableWindow(s_hBtnUpdate, TRUE);
+                            std::wstring btnText = L"🚀 Обновить";
+                            {
+                                std::lock_guard<std::mutex> lock(g_updateMutex);
+                                if (!g_updateInfo.latestVersion.empty()) {
+                                    btnText += L" (" + g_updateInfo.latestVersion + L")";
+                                }
+                            }
+                            SetWindowTextW(s_hBtnUpdate, btnText.c_str());
+                        }
+
+                        int openWeb = MessageBoxW(hWnd,
+                            L"Не удалось автоматически загрузить файл обновления.\nОткрыть страницу релиза на GitHub?",
+                            L"Ошибка обновления", MB_YESNO | MB_ICONERROR);
+                        if (openWeb == IDYES) {
+                            ShellExecuteW(NULL, L"open", relUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                        }
+                        return;
+                    }
+
+                    // Создаем bat-скрипт для авто-обновления без переустановки
+                    std::wofstream bat(tempBat);
+                    if (bat.is_open()) {
+                        bat << L"@echo off\n";
+                        bat << L"chcp 65001 >nul\n";
+                        bat << L"timeout /t 1 /nobreak >nul\n";
+                        bat << L":retry\n";
+                        bat << L"del /f /q \"" << currentExe << L"\" >nul 2>&1\n";
+                        bat << L"if exist \"" << currentExe << L"\" (\n";
+                        bat << L"    timeout /t 1 /nobreak >nul\n";
+                        bat << L"    goto retry\n";
+                        bat << L")\n";
+                        bat << L"move /y \"" << tempNewExe << L"\" \"" << currentExe << L"\" >nul 2>&1\n";
+                        bat << L"start \"\" \"" << currentExe << L"\"\n";
+                        bat << L"del /f /q \"%~f0\" >nul 2>&1\n";
+                        bat.close();
+
+                        ShellExecuteW(NULL, L"open", tempBat.c_str(), NULL, NULL, SW_HIDE);
+                        ExitProcess(0);
+                    }
+                }).detach();
+            }
         }
         return 0;
     }
@@ -2127,6 +2655,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         hLblQuality = hSliderQuality = hEditQuality = hLblPercent = NULL;
         hBtnInstallFFmpeg = NULL;
         hChkSysAudio = hChkMic = hLblMicChoice = hComboMic = NULL;
+        s_hLblVersion = s_hBtnGitHub = s_hBtnUpdate = NULL;
         s_detectedMics.clear();
         return 0;
     }
@@ -2161,7 +2690,7 @@ void OpenSettingsDialog() {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassExW(&wc);
 
-    int w = 535, h = 550;
+    int w = 535, h = 580;
     int sx = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
     int sy = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
 
@@ -2319,6 +2848,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
 
     // Установка низкоуровневого хука клавиатуры (WH_KEYBOARD_LL)
     g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
+
+    // Фоновая проверка наличия обновлений при запуске
+    std::thread([]() {
+        Sleep(2500);
+        UpdateInfo info;
+        if (CheckForUpdates(info)) {
+            std::lock_guard<std::mutex> lock(g_updateMutex);
+            g_updateInfo = info;
+            if (g_hSettingsWnd && IsWindow(g_hSettingsWnd)) {
+                PostMessageW(g_hSettingsWnd, WM_UPDATE_CHECK_DONE, 0, 0);
+            }
+        }
+    }).detach();
 
     // Основной цикл сообщений
     MSG msg;

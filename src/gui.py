@@ -6,6 +6,9 @@
 
 import os
 import sys
+import json
+import urllib.request
+import webbrowser
 import threading
 import subprocess
 import tkinter as tk
@@ -13,6 +16,59 @@ from tkinter import ttk, filedialog, messagebox
 from config import cfg, get_default_recordings_dir
 from autostart import is_autostart_enabled, set_autostart, uninstall
 from recorder import find_ffmpeg_executable, install_ffmpeg, get_audio_devices
+
+APP_VERSION = "1.1.0"
+GITHUB_REPO_URL = "https://github.com/Hikerys/WinScreen"
+GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/Hikerys/WinScreen/releases/latest"
+
+
+def parse_version(v_str):
+    s = v_str.lstrip("vV ").strip()
+    parts = []
+    for part in s.split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def is_newer_version(remote_str, current_str):
+    return parse_version(remote_str) > parse_version(current_str)
+
+
+def check_for_updates():
+    try:
+        req = urllib.request.Request(
+            GITHUB_API_LATEST_RELEASE,
+            headers={"User-Agent": "WinScreen-UpdateChecker/1.1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            tag = data.get("tag_name", "")
+            html_url = data.get("html_url", GITHUB_REPO_URL + "/releases/latest")
+            download_url = ""
+            for asset in data.get("assets", []):
+                if asset.get("name", "").endswith(".exe"):
+                    download_url = asset.get("browser_download_url", "")
+                    break
+            if not download_url:
+                download_url = f"{GITHUB_REPO_URL}/releases/download/{tag}/WinScreen.exe"
+            if tag and is_newer_version(tag, APP_VERSION):
+                return {
+                    "has_update": True,
+                    "latest_version": tag,
+                    "release_url": html_url,
+                    "download_url": download_url
+                }
+    except Exception:
+        pass
+    return None
 
 
 class SettingsWindow:
@@ -40,8 +96,10 @@ class SettingsWindow:
         self.hk_btns = {}
         self.prev_hk_values = {}
         self.detected_devices = {"microphones": [], "system_audio": None}
+        self.update_info = None
         self.setup_ui()
         self.load_values()
+        threading.Thread(target=self.check_updates_background, daemon=True).start()
 
     def center_window(self):
         self.root.update_idletasks()
@@ -373,6 +431,41 @@ class SettingsWindow:
             command=self.save_and_apply
         )
         save_btn.pack(side="right")
+
+        # Подвал: версия, кнопка обновления и переход на GitHub
+        footer_frame = tk.Frame(self.root, bg=self.bg_color)
+        footer_frame.pack(fill="x", padx=20, pady=(2, 12))
+
+        version_lbl = tk.Label(
+            footer_frame,
+            text=f"WinScreen v{APP_VERSION}",
+            font=("Segoe UI", 9),
+            fg="#707070",
+            bg=self.bg_color
+        )
+        version_lbl.pack(side="left")
+
+        self.update_btn = tk.Button(
+            footer_frame,
+            text="🚀 Обновить",
+            font=("Segoe UI", 9, "bold"),
+            bg="#107C41",
+            fg="white",
+            relief="flat",
+            padx=10,
+            pady=2,
+            command=self.on_update_clicked
+        )
+        # Отображается только при наличии более новой версии на GitHub
+
+        github_btn = tk.Button(
+            footer_frame,
+            text="GitHub",
+            font=("Segoe UI", 9),
+            relief="groove",
+            command=lambda: webbrowser.open(GITHUB_REPO_URL)
+        )
+        github_btn.pack(side="right")
 
         self.root.bind("<KeyPress>", self.on_key_press)
         self.root.bind("<KeyRelease>", self.on_key_release)
@@ -759,6 +852,71 @@ class SettingsWindow:
             messagebox.showinfo("WinScreen", "WinScreen успешно удален из автозагрузки.")
             self.root.destroy()
             sys.exit(0)
+
+    def check_updates_background(self):
+        info = check_for_updates()
+        if info and info.get("has_update"):
+            self.root.after(0, lambda: self._show_update_button(info))
+
+    def _show_update_button(self, info):
+        self.update_info = info
+        self.update_btn.config(text=f"🚀 Обновить ({info['latest_version']})")
+        self.update_btn.pack(side="left", padx=10)
+
+    def on_update_clicked(self):
+        if not self.update_info:
+            return
+        info = self.update_info
+        res = messagebox.askyesnocancel(
+            "Обновление WinScreen",
+            f"Доступна новая версия {info['latest_version']}!\n\n"
+            "Нажмите «Да», чтобы обновить приложение автоматически без переустановки.\n"
+            "Нажмите «Нет», чтобы перейти на страницу релиза на GitHub.\n"
+            "Нажмите «Отмена», чтобы отложить."
+        )
+        if res is False:
+            webbrowser.open(info["release_url"])
+        elif res is True:
+            self.update_btn.config(state="disabled", text="⏳ Загрузка обновления...")
+            threading.Thread(target=self._perform_auto_update, args=(info,), daemon=True).start()
+
+    def _perform_auto_update(self, info):
+        try:
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            new_exe = os.path.join(temp_dir, "WinScreen_update.exe")
+            bat_path = os.path.join(temp_dir, "winscreen_updater.bat")
+            cur_exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+
+            req = urllib.request.Request(info["download_url"], headers={"User-Agent": "WinScreen-UpdateChecker"})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(new_exe, "wb") as f:
+                f.write(resp.read())
+
+            with open(bat_path, "w", encoding="utf-8") as bat:
+                bat.write(
+                    f'@echo off\n'
+                    f'chcp 65001 >nul\n'
+                    f'timeout /t 1 /nobreak >nul\n'
+                    f':retry\n'
+                    f'del /f /q "{cur_exe}" >nul 2>&1\n'
+                    f'if exist "{cur_exe}" (\n'
+                    f'    timeout /t 1 /nobreak >nul\n'
+                    f'    goto retry\n'
+                    f')\n'
+                    f'move /y "{new_exe}" "{cur_exe}" >nul 2>&1\n'
+                    f'start "" "{cur_exe}"\n'
+                    f'del /f /q "%~f0" >nul 2>&1\n'
+                )
+
+            subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=0x08000000 if os.name == "nt" else 0)
+            self.root.destroy()
+            sys.exit(0)
+        except Exception as e:
+            def on_fail():
+                self.update_btn.config(state="normal", text="🚀 Обновить")
+                if messagebox.askyesno("Ошибка авто-обновления", f"Не удалось автоматически загрузить файл обновления: {e}\n\nОткрыть страницу релиза на GitHub?"):
+                    webbrowser.open(info["release_url"])
+            self.root.after(0, on_fail)
 
     def show(self):
         self.root.mainloop()

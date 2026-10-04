@@ -21,7 +21,7 @@ if not exist "build" mkdir "build"
 if not exist "bin" mkdir "bin"
 
 echo Компиляция cpp\winscreen.cpp...
-cl /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE /Fo"build\\" /Fd"build\\" cpp\winscreen.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib shell32.lib advapi32.lib shcore.lib comctl32.lib ole32.lib oleaut32.lib urlmon.lib /OUT:bin\WinScreen.exe
+cl /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE /Fo"build\\" /Fd"build\\" cpp\winscreen.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib shell32.lib advapi32.lib shcore.lib comctl32.lib ole32.lib oleaut32.lib urlmon.lib msimg32.lib dwmapi.lib wininet.lib /OUT:bin\WinScreen.exe
 
 if %errorlevel% equ 0 (
     echo.
