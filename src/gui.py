@@ -17,7 +17,7 @@ from config import cfg, get_default_recordings_dir
 from autostart import is_autostart_enabled, set_autostart, uninstall
 from recorder import find_ffmpeg_executable, install_ffmpeg, get_audio_devices
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 GITHUB_REPO_URL = "https://github.com/Hikerys/WinScreen"
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/Hikerys/WinScreen/releases/latest"
 
@@ -46,7 +46,7 @@ def check_for_updates():
     try:
         req = urllib.request.Request(
             GITHUB_API_LATEST_RELEASE,
-            headers={"User-Agent": "WinScreen-UpdateChecker/1.1.0"}
+            headers={"User-Agent": "WinScreen-UpdateChecker/1.2.0"}
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))

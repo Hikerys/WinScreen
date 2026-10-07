@@ -25,6 +25,8 @@
 #include <audioclient.h>
 #include <propsys.h>
 #include <deque>
+#include <tlhelp32.h>
+#include "json.hpp"
 
 using std::min;
 using std::max;
@@ -42,11 +44,12 @@ using std::max;
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "version.lib")
 
 using namespace Gdiplus;
 
 // Версия и ссылки
-const std::wstring APP_VERSION = L"1.1.0";
+const std::wstring APP_VERSION = L"1.2.0";
 const std::wstring GITHUB_REPO_URL = L"https://github.com/Hikerys/WinScreen";
 const std::wstring GITHUB_API_LATEST_RELEASE = L"https://api.github.com/repos/Hikerys/WinScreen/releases/latest";
 
@@ -228,12 +231,18 @@ void TriggerFullScreenCapture();
 void TriggerLiveAreaCapture();
 void TriggerFrozenAreaCapture();
 void ShowNotification(const std::wstring& title, const std::wstring& message);
-void AutoInstallIfNeeded();
+void LoadSettings();
+void SaveSettings();
 bool IsAutostartEnabled();
 void SetAutostart(bool enable);
 void UninstallApp();
 void OpenScreenshotsFolder();
 void OpenSettingsDialog();
+void KillPreviousInstances();
+bool ShowInstallerDialog(HINSTANCE hInstance, bool& outAutostart);
+bool PerformInstallOrUpgrade(const std::wstring& currentExe, bool enableAutostart);
+std::wstring GetInstalledVersion();
+int CompareVersions(const std::wstring& v1, const std::wstring& v2);
 
 // Получение системной папки скриншотов
 std::wstring GetDefaultScreenshotsDir() {
@@ -271,6 +280,121 @@ std::wstring GetAppDataDir() {
     return L".";
 }
 
+std::wstring GetSettingsFilePath() {
+    return GetAppDataDir() + L"\\settings.json";
+}
+
+std::wstring GetLegacyConfigFilePath() {
+    return GetAppDataDir() + L"\\config.txt";
+}
+
+std::wstring GetLegacyJsonConfigFilePath() {
+    return GetAppDataDir() + L"\\config.json";
+}
+
+std::wstring GetInstalledExePath() {
+    return GetAppDataDir() + L"\\WinScreen.exe";
+}
+
+bool IsWinScreenInstalled() {
+    std::wstring p = GetInstalledExePath();
+    DWORD attr = GetFileAttributesW(p.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+// Преобразование UTF-8 <-> Wide String
+std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.length(), NULL, 0);
+    std::wstring wide(len, 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.length(), &wide[0], len);
+    return wide;
+}
+
+std::string WideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.length(), NULL, 0, NULL, NULL);
+    std::string utf8(len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.length(), &utf8[0], len, NULL, NULL);
+    return utf8;
+}
+
+struct SemVer {
+    int major = 0;
+    int minor = 0;
+    int patch = 0;
+};
+
+SemVer ParseSemVer(const std::wstring& s) {
+    SemVer v;
+    std::wstring clean = s;
+    if (!clean.empty() && (clean[0] == L'v' || clean[0] == L'V')) {
+        clean = clean.substr(1);
+    }
+    std::wstringstream ss(clean);
+    std::wstring part;
+    if (std::getline(ss, part, L'.')) v.major = _wtoi(part.c_str());
+    if (std::getline(ss, part, L'.')) v.minor = _wtoi(part.c_str());
+    if (std::getline(ss, part, L'.')) v.patch = _wtoi(part.c_str());
+    return v;
+}
+
+int CompareVersions(const std::wstring& v1, const std::wstring& v2) {
+    SemVer a = ParseSemVer(v1);
+    SemVer b = ParseSemVer(v2);
+    if (a.major != b.major) return a.major < b.major ? -1 : 1;
+    if (a.minor != b.minor) return a.minor < b.minor ? -1 : 1;
+    if (a.patch != b.patch) return a.patch < b.patch ? -1 : 1;
+    return 0;
+}
+
+std::wstring GetExeFileVersion(const std::wstring& filePath) {
+    DWORD handle = 0;
+    DWORD size = GetFileVersionInfoSizeW(filePath.c_str(), &handle);
+    if (size == 0) return L"";
+    std::vector<BYTE> data(size);
+    if (!GetFileVersionInfoW(filePath.c_str(), handle, size, data.data())) return L"";
+
+    VS_FIXEDFILEINFO* pFileInfo = NULL;
+    UINT len = 0;
+    if (VerQueryValueW(data.data(), L"\\", (LPVOID*)&pFileInfo, &len) && len >= sizeof(VS_FIXEDFILEINFO)) {
+        int maj = HIWORD(pFileInfo->dwFileVersionMS);
+        int min = LOWORD(pFileInfo->dwFileVersionMS);
+        int patch = HIWORD(pFileInfo->dwFileVersionLS);
+        return std::to_wstring(maj) + L"." + std::to_wstring(min) + L"." + std::to_wstring(patch);
+    }
+    return L"";
+}
+
+std::wstring GetInstalledVersion() {
+    if (!IsWinScreenInstalled()) return L"";
+
+    // 1. Проверяем settings.json
+    std::wstring jsonPath = GetSettingsFilePath();
+    std::ifstream fin(WideToUtf8(jsonPath), std::ios::binary);
+    if (fin.is_open()) {
+        std::stringstream ss;
+        ss << fin.rdbuf();
+        fin.close();
+        std::string s = ss.str();
+        if (!s.empty()) {
+            JsonParser p(Utf8ToWide(s));
+            JsonValue root = p.parseValue();
+            if (root.isObject() && root.has(L"version")) {
+                std::wstring v = root.getString(L"version");
+                if (!v.empty()) return v;
+            }
+        }
+    }
+
+    // 2. Проверяем PE FileVersion установленного exe
+    std::wstring peVer = GetExeFileVersion(GetInstalledExePath());
+    if (!peVer.empty()) return peVer;
+
+    // 3. Если файл существует, но версии нет (v1.1.0/v1.0.0)
+    return L"1.1.0";
+}
+
 // Поиск исполняемого файла FFmpeg
 std::wstring GetFFmpegPath() {
     // 1. Рядом с запущенным исполняемым файлом
@@ -303,6 +427,44 @@ bool IsFFmpegInstalled() {
     return !GetFFmpegPath().empty();
 }
 
+class DownloadProgressCallback : public IBindStatusCallback {
+public:
+    HWND m_hBtn;
+    bool* m_pCancel;
+
+    DownloadProgressCallback(HWND hBtn = NULL, bool* pCancel = NULL)
+        : m_hBtn(hBtn), m_pCancel(pCancel) {}
+
+    STDMETHOD(QueryInterface)(REFIID riid, void** ppvObject) {
+        if (!ppvObject) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) {
+            *ppvObject = static_cast<IBindStatusCallback*>(this);
+            return S_OK;
+        }
+        *ppvObject = NULL;
+        return E_NOINTERFACE;
+    }
+    STDMETHOD_(ULONG, AddRef)() { return 1; }
+    STDMETHOD_(ULONG, Release)() { return 1; }
+
+    STDMETHOD(OnStartBinding)(DWORD, IBinding*) { return S_OK; }
+    STDMETHOD(GetPriority)(LONG*) { return S_OK; }
+    STDMETHOD(OnLowResource)(DWORD) { return S_OK; }
+    STDMETHOD(OnProgress)(ULONG ulProgress, ULONG ulProgressMax, ULONG ulStatusCode, LPCWSTR szStatusText) {
+        if (m_pCancel && *m_pCancel) return E_ABORT;
+        if (ulProgressMax > 0 && m_hBtn && IsWindow(m_hBtn)) {
+            int pct = (int)((unsigned long long)ulProgress * 100 / ulProgressMax);
+            std::wstring txt = L"⏳ Загрузка FFmpeg (" + std::to_wstring(pct) + L"%)...";
+            SetWindowTextW(m_hBtn, txt.c_str());
+        }
+        return S_OK;
+    }
+    STDMETHOD(OnStopBinding)(HRESULT, LPCWSTR) { return S_OK; }
+    STDMETHOD(GetBindInfo)(DWORD*, BINDINFO*) { return S_OK; }
+    STDMETHOD(OnDataAvailable)(DWORD, DWORD, FORMATETC*, STGMEDIUM*) { return S_OK; }
+    STDMETHOD(OnObjectAvailable)(REFIID, IUnknown*) { return S_OK; }
+};
+
 struct DownloadParams {
     HWND hDlg;
     HWND hBtn;
@@ -317,7 +479,8 @@ DWORD WINAPI DownloadFFmpegThread(LPVOID lpParam) {
 
     const WCHAR* url = L"https://github.com/imageio/imageio-binaries/raw/master/ffmpeg/ffmpeg-win64-v4.2.2.exe";
 
-    HRESULT hr = URLDownloadToFileW(NULL, url, tempDest.c_str(), 0, NULL);
+    DownloadProgressCallback cb(dp ? dp->hBtn : NULL, NULL);
+    HRESULT hr = URLDownloadToFileW(NULL, url, tempDest.c_str(), 0, &cb);
     if (SUCCEEDED(hr)) {
         MoveFileExW(tempDest.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING);
         if (dp && dp->hDlg) {
@@ -361,58 +524,159 @@ void ParseHotkeyConfig(const std::wstring& val, HotkeyConfig& hk) {
     }
 }
 
+void SaveHotkeyToJson(JsonValue& obj, const std::wstring& name, const HotkeyConfig& hk) {
+    JsonValue hkObj = JsonValue::Object();
+    hkObj.set(L"vk", (int)hk.vkCode);
+    hkObj.set(L"ctrl", hk.ctrl);
+    hkObj.set(L"shift", hk.shift);
+    hkObj.set(L"alt", hk.alt);
+    hkObj.set(L"win", hk.win);
+    hkObj.set(L"display", hk.displayText);
+    obj.set(name, hkObj);
+}
+
+void LoadHotkeyFromJson(const JsonValue& obj, const std::wstring& name, HotkeyConfig& hk) {
+    if (!obj.has(name)) return;
+    JsonValue hkObj = obj.getObj(name);
+    hk.vkCode = (DWORD)hkObj.getInt(L"vk", (int)hk.vkCode);
+    hk.ctrl = hkObj.getBool(L"ctrl", hk.ctrl);
+    hk.shift = hkObj.getBool(L"shift", hk.shift);
+    hk.alt = hkObj.getBool(L"alt", hk.alt);
+    hk.win = hkObj.getBool(L"win", hk.win);
+    hk.displayText = FormatHotkey(hk.vkCode, hk.ctrl, hk.shift, hk.alt, hk.win);
+}
+
 // Загрузка и сохранение настроек
 void LoadSettings() {
     g_saveDir = GetDefaultScreenshotsDir();
     g_videoSaveDir = GetDefaultRecordingsDir();
-    std::wstring cfgFile = GetAppDataDir() + L"\\config.txt";
-    std::wifstream fin(cfgFile);
+
+    std::wstring jsonPath = GetSettingsFilePath();
+    std::wstring legacyJsonPath = GetLegacyJsonConfigFilePath();
+    std::wstring legacyPath = GetLegacyConfigFilePath();
+
+    bool loaded = false;
+
+    // 1. Попытка загрузить современный settings.json
+    std::ifstream fin(WideToUtf8(jsonPath), std::ios::binary);
+    if (!fin.is_open()) {
+        // Проверяем config.json (от Python версии)
+        fin.open(WideToUtf8(legacyJsonPath), std::ios::binary);
+    }
+
     if (fin.is_open()) {
-        std::wstring line;
-        while (std::getline(fin, line)) {
-            size_t eq = line.find(L'=');
-            if (eq != std::wstring::npos) {
-                std::wstring key = line.substr(0, eq);
-                std::wstring val = line.substr(eq + 1);
-                if (key == L"dir" && !val.empty()) g_saveDir = val;
-                else if (key == L"video_dir" && !val.empty()) g_videoSaveDir = val;
-                else if (key == L"format") g_fileFormat = val;
-                else if (key == L"quality") g_jpgQuality = max(1, min(100, _wtoi(val.c_str())));
-                else if (key == L"clipboard") g_copyClipboard = (val == L"1");
-                else if (key == L"disk") g_saveDisk = (val == L"1");
-                else if (key == L"notify") g_showNotifications = (val == L"1");
-                else if (key == L"hk_full") ParseHotkeyConfig(val, g_hkFullscreen);
-                else if (key == L"hk_live") ParseHotkeyConfig(val, g_hkLive);
-                else if (key == L"hk_frozen") ParseHotkeyConfig(val, g_hkFrozen);
-                else if (key == L"hk_record") ParseHotkeyConfig(val, g_hkRecord);
-                else if (key == L"record_system_audio") g_recordSysAudio = (val == L"1");
-                else if (key == L"record_microphone") g_recordMic = (val == L"1");
-                else if (key == L"selected_microphone") g_selectedMic = val;
+        std::stringstream ss;
+        ss << fin.rdbuf();
+        fin.close();
+        std::string content = ss.str();
+        if (!content.empty()) {
+            JsonParser parser(Utf8ToWide(content));
+            JsonValue root = parser.parseValue();
+            if (root.isObject()) {
+                loaded = true;
+                if (root.has(L"save_dir")) g_saveDir = root.getString(L"save_dir");
+                else if (root.has(L"save_directory")) g_saveDir = root.getString(L"save_directory");
+
+                if (root.has(L"video_dir")) g_videoSaveDir = root.getString(L"video_dir");
+                else if (root.has(L"video_save_directory")) g_videoSaveDir = root.getString(L"video_save_directory");
+
+                if (root.has(L"format")) g_fileFormat = root.getString(L"format");
+                else if (root.has(L"file_format")) g_fileFormat = root.getString(L"file_format");
+
+                if (root.has(L"quality")) g_jpgQuality = max(1, min(100, root.getInt(L"quality", 90)));
+                else if (root.has(L"jpg_quality")) g_jpgQuality = max(1, min(100, root.getInt(L"jpg_quality", 90)));
+
+                if (root.has(L"copy_clipboard")) g_copyClipboard = root.getBool(L"copy_clipboard", true);
+                else if (root.has(L"copy_to_clipboard")) g_copyClipboard = root.getBool(L"copy_to_clipboard", true);
+
+                if (root.has(L"save_disk")) g_saveDisk = root.getBool(L"save_disk", true);
+                else if (root.has(L"save_to_disk")) g_saveDisk = root.getBool(L"save_to_disk", true);
+
+                if (root.has(L"notifications")) g_showNotifications = root.getBool(L"notifications", true);
+                else if (root.has(L"show_notifications")) g_showNotifications = root.getBool(L"show_notifications", true);
+
+                if (root.has(L"record_system_audio")) g_recordSysAudio = root.getBool(L"record_system_audio", false);
+                if (root.has(L"record_microphone")) g_recordMic = root.getBool(L"record_microphone", false);
+                if (root.has(L"selected_microphone")) g_selectedMic = root.getString(L"selected_microphone", L"");
+
+                if (root.has(L"hotkeys")) {
+                    JsonValue hks = root.getObj(L"hotkeys");
+                    LoadHotkeyFromJson(hks, L"fullscreen", g_hkFullscreen);
+                    LoadHotkeyFromJson(hks, L"live", g_hkLive);
+                    LoadHotkeyFromJson(hks, L"frozen", g_hkFrozen);
+                    LoadHotkeyFromJson(hks, L"record", g_hkRecord);
+                }
             }
         }
     }
+
+    // 2. Если JSON не загружен, проверяем legacy config.txt (от v1.1.0)
+    if (!loaded) {
+        std::wifstream lfin(legacyPath);
+        if (lfin.is_open()) {
+            std::wstring line;
+            while (std::getline(lfin, line)) {
+                size_t eq = line.find(L'=');
+                if (eq != std::wstring::npos) {
+                    std::wstring key = line.substr(0, eq);
+                    std::wstring val = line.substr(eq + 1);
+                    if (key == L"dir" && !val.empty()) g_saveDir = val;
+                    else if (key == L"video_dir" && !val.empty()) g_videoSaveDir = val;
+                    else if (key == L"format") g_fileFormat = val;
+                    else if (key == L"quality") g_jpgQuality = max(1, min(100, _wtoi(val.c_str())));
+                    else if (key == L"clipboard") g_copyClipboard = (val == L"1");
+                    else if (key == L"disk") g_saveDisk = (val == L"1");
+                    else if (key == L"notify") g_showNotifications = (val == L"1");
+                    else if (key == L"hk_full") ParseHotkeyConfig(val, g_hkFullscreen);
+                    else if (key == L"hk_live") ParseHotkeyConfig(val, g_hkLive);
+                    else if (key == L"hk_frozen") ParseHotkeyConfig(val, g_hkFrozen);
+                    else if (key == L"hk_record") ParseHotkeyConfig(val, g_hkRecord);
+                    else if (key == L"record_system_audio") g_recordSysAudio = (val == L"1");
+                    else if (key == L"record_microphone") g_recordMic = (val == L"1");
+                    else if (key == L"selected_microphone") g_selectedMic = val;
+                }
+            }
+            lfin.close();
+            // Сразу сохраняем прочитанные настройки в новый формат settings.json
+            SaveSettings();
+        }
+    }
+
     CreateDirectoryW(g_saveDir.c_str(), NULL);
     CreateDirectoryW(g_videoSaveDir.c_str(), NULL);
 }
 
 void SaveSettings() {
-    std::wstring cfgFile = GetAppDataDir() + L"\\config.txt";
-    std::wofstream fout(cfgFile);
+    CreateDirectoryW(GetAppDataDir().c_str(), NULL);
+
+    JsonValue root = JsonValue::Object();
+    root.set(L"version", APP_VERSION);
+    root.set(L"save_dir", g_saveDir);
+    root.set(L"video_dir", g_videoSaveDir);
+    root.set(L"format", g_fileFormat);
+    root.set(L"quality", g_jpgQuality);
+    root.set(L"copy_clipboard", g_copyClipboard);
+    root.set(L"save_disk", g_saveDisk);
+    root.set(L"notifications", g_showNotifications);
+    root.set(L"autostart", IsAutostartEnabled());
+    root.set(L"record_system_audio", g_recordSysAudio);
+    root.set(L"record_microphone", g_recordMic);
+    root.set(L"selected_microphone", g_selectedMic);
+
+    JsonValue hks = JsonValue::Object();
+    SaveHotkeyToJson(hks, L"fullscreen", g_hkFullscreen);
+    SaveHotkeyToJson(hks, L"live", g_hkLive);
+    SaveHotkeyToJson(hks, L"frozen", g_hkFrozen);
+    SaveHotkeyToJson(hks, L"record", g_hkRecord);
+    root.set(L"hotkeys", hks);
+
+    std::wstring serialized = root.serialize(0);
+    std::string utf8 = WideToUtf8(serialized);
+
+    std::ofstream fout(WideToUtf8(GetSettingsFilePath()), std::ios::binary);
     if (fout.is_open()) {
-        fout << L"dir=" << g_saveDir << L"\n";
-        fout << L"video_dir=" << g_videoSaveDir << L"\n";
-        fout << L"format=" << g_fileFormat << L"\n";
-        fout << L"quality=" << g_jpgQuality << L"\n";
-        fout << L"clipboard=" << (g_copyClipboard ? 1 : 0) << L"\n";
-        fout << L"disk=" << (g_saveDisk ? 1 : 0) << L"\n";
-        fout << L"notify=" << (g_showNotifications ? 1 : 0) << L"\n";
-        fout << L"record_system_audio=" << (g_recordSysAudio ? 1 : 0) << L"\n";
-        fout << L"record_microphone=" << (g_recordMic ? 1 : 0) << L"\n";
-        fout << L"selected_microphone=" << g_selectedMic << L"\n";
-        fout << L"hk_full=" << g_hkFullscreen.vkCode << L"," << (g_hkFullscreen.ctrl?1:0) << L"," << (g_hkFullscreen.shift?1:0) << L"," << (g_hkFullscreen.alt?1:0) << L"," << (g_hkFullscreen.win?1:0) << L"\n";
-        fout << L"hk_live=" << g_hkLive.vkCode << L"," << (g_hkLive.ctrl?1:0) << L"," << (g_hkLive.shift?1:0) << L"," << (g_hkLive.alt?1:0) << L"," << (g_hkLive.win?1:0) << L"\n";
-        fout << L"hk_frozen=" << g_hkFrozen.vkCode << L"," << (g_hkFrozen.ctrl?1:0) << L"," << (g_hkFrozen.shift?1:0) << L"," << (g_hkFrozen.alt?1:0) << L"," << (g_hkFrozen.win?1:0) << L"\n";
-        fout << L"hk_record=" << g_hkRecord.vkCode << L"," << (g_hkRecord.ctrl?1:0) << L"," << (g_hkRecord.shift?1:0) << L"," << (g_hkRecord.alt?1:0) << L"," << (g_hkRecord.win?1:0) << L"\n";
+        fout.write(utf8.data(), utf8.size());
+        fout.close();
     }
 }
 
@@ -1917,9 +2181,8 @@ void SetAutostart(bool enable) {
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
         if (enable) {
-            WCHAR exePath[MAX_PATH];
-            GetModuleFileNameW(NULL, exePath, MAX_PATH);
-            std::wstring cmd = L"\"" + std::wstring(exePath) + L"\"";
+            std::wstring targetExe = GetInstalledExePath();
+            std::wstring cmd = L"\"" + targetExe + L"\" --autostart";
             RegSetValueExW(hKey, REG_APP_NAME, 0, REG_SZ, (const BYTE*)cmd.c_str(), (cmd.length() + 1) * sizeof(WCHAR));
         } else {
             RegDeleteValueW(hKey, REG_APP_NAME);
@@ -1938,31 +2201,296 @@ void DisableWindowsSnippingToolHook() {
     }
 }
 
-// Автоустановка при первом запуске
-void AutoInstallIfNeeded() {
-    DisableWindowsSnippingToolHook();
+// Завершение любых предыдущих процессов WinScreen (гарантирует единственный процесс)
+void KillPreviousInstances() {
+    DWORD currentPid = GetCurrentProcessId();
 
-    WCHAR currentExe[MAX_PATH];
-    GetModuleFileNameW(NULL, currentExe, MAX_PATH);
+    // 1. Посылаем WM_CLOSE окнам ядра WinScreen_Core других процессов
+    HWND hCoreWnd = NULL;
+    while ((hCoreWnd = FindWindowW(L"WinScreen_Core", NULL)) != NULL) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hCoreWnd, &pid);
+        if (pid == currentPid) break;
+        PostMessageW(hCoreWnd, WM_CLOSE, 0, 0);
+        SetWindowTextW(hCoreWnd, L"Closing");
+        Sleep(40);
+    }
+
+    // 2. Ищем все процессы WinScreen.exe и завершаем их
+    WCHAR currentExePath[MAX_PATH];
+    GetModuleFileNameW(NULL, currentExePath, MAX_PATH);
+    const WCHAR* exeName = wcsrchr(currentExePath, L'\\');
+    exeName = exeName ? exeName + 1 : currentExePath;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (pe.th32ProcessID != currentPid) {
+                    bool match = (_wcsicmp(pe.szExeFile, L"WinScreen.exe") == 0) ||
+                                 (_wcsicmp(pe.szExeFile, exeName) == 0);
+                    if (match) {
+                        HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+                        if (hProc) {
+                            if (WaitForSingleObject(hProc, 150) == WAIT_TIMEOUT) {
+                                TerminateProcess(hProc, 0);
+                            }
+                            CloseHandle(hProc);
+                        }
+                    }
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+}
+
+bool CopyFileWithRetry(const std::wstring& src, const std::wstring& dst, int maxRetries = 10, int delayMs = 100) {
+    for (int i = 0; i < maxRetries; ++i) {
+        if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
+            return true;
+        }
+        Sleep(delayMs);
+    }
+    return false;
+}
+
+bool PerformInstallOrUpgrade(const std::wstring& currentExe, bool enableAutostart) {
+    KillPreviousInstances();
 
     std::wstring appDir = GetAppDataDir();
-    std::wstring targetExe = appDir + L"\\WinScreen.exe";
+    CreateDirectoryW(appDir.c_str(), NULL);
+    std::wstring targetExe = GetInstalledExePath();
 
-    // Если запущено не из %APPDATA%\WinScreen
-    if (_wcsicmp(currentExe, targetExe.c_str()) != 0) {
-        CopyFileW(currentExe, targetExe.c_str(), FALSE);
-
-        HKEY hKey;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-            std::wstring cmd = L"\"" + targetExe + L"\"";
-            RegSetValueExW(hKey, REG_APP_NAME, 0, REG_SZ, (const BYTE*)cmd.c_str(), (cmd.length() + 1) * sizeof(WCHAR));
-            RegCloseKey(hKey);
-        }
-    } else {
-        if (!IsAutostartEnabled()) {
-            SetAutostart(true);
+    if (_wcsicmp(currentExe.c_str(), targetExe.c_str()) != 0) {
+        if (!CopyFileWithRetry(currentExe, targetExe)) {
+            std::wstring errText = L"Не удалось скопировать исполняемый файл в папку установки:\n" + targetExe +
+                L"\n\nПопробуйте закрыть другие программы и повторить попытку.";
+            MessageBoxW(NULL, errText.c_str(), L"Ошибка установки", MB_OK | MB_ICONERROR);
+            return false;
         }
     }
+
+    DisableWindowsSnippingToolHook();
+    SetAutostart(enableAutostart);
+    SaveSettings();
+    return true;
+}
+
+#define WM_INSTALLER_FFMPEG_DONE (WM_USER + 210)
+
+// Окно одноэтапного установщика
+static bool s_installConfirmed = false;
+static bool s_allowAutostart = true;
+static HWND s_hChkAutostart = NULL;
+static HWND s_hChkFFmpeg = NULL;
+static HWND s_hBtnInstall = NULL;
+static HWND s_hBtnCancel = NULL;
+static bool s_isDownloadingFFmpeg = false;
+static bool s_cancelInstallerDownload = false;
+
+struct InstallerDownloadParams {
+    HWND hWnd;
+    HWND hBtn;
+};
+
+DWORD WINAPI InstallerFFmpegDownloadThread(LPVOID lpParam) {
+    InstallerDownloadParams* p = (InstallerDownloadParams*)lpParam;
+    HWND hWnd = p->hWnd;
+    HWND hBtn = p->hBtn;
+    delete p;
+
+    std::wstring destDir = GetAppDataDir();
+    CreateDirectoryW(destDir.c_str(), NULL);
+    std::wstring dest = destDir + L"\\ffmpeg.exe";
+    std::wstring tempDest = dest + L".tmp";
+
+    const WCHAR* url = L"https://github.com/imageio/imageio-binaries/raw/master/ffmpeg/ffmpeg-win64-v4.2.2.exe";
+
+    DownloadProgressCallback cb(hBtn, &s_cancelInstallerDownload);
+    HRESULT hr = URLDownloadToFileW(NULL, url, tempDest.c_str(), 0, &cb);
+
+    bool ok = false;
+    if (SUCCEEDED(hr) && !s_cancelInstallerDownload) {
+        if (MoveFileExW(tempDest.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            ok = true;
+        }
+    } else {
+        DeleteFileW(tempDest.c_str());
+    }
+
+    if (IsWindow(hWnd)) {
+        PostMessageW(hWnd, WM_INSTALLER_FFMPEG_DONE, ok ? 1 : 0, 0);
+    }
+    return 0;
+}
+
+LRESULT CALLBACK InstallerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        s_isDownloadingFFmpeg = false;
+        s_cancelInstallerDownload = false;
+
+        HFONT hTitleFont = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT hBoldFont = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT hTextFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+        HICON hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+        if (hIcon) {
+            SendMessageW(hWnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+            SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+        }
+
+        HWND lblTitle = CreateWindowW(L"STATIC", (L"Установка WinScreen v" + APP_VERSION).c_str(), WS_CHILD | WS_VISIBLE, 25, 18, 430, 26, hWnd, NULL, g_hInstance, NULL);
+        SendMessageW(lblTitle, WM_SETFONT, (WPARAM)hTitleFont, TRUE);
+
+        HWND lblSubtitle = CreateWindowW(L"STATIC", L"Подтвердить установку", WS_CHILD | WS_VISIBLE, 25, 48, 430, 22, hWnd, NULL, g_hInstance, NULL);
+        SendMessageW(lblSubtitle, WM_SETFONT, (WPARAM)hBoldFont, TRUE);
+
+        HWND lblDesc = CreateWindowW(L"STATIC", L"Быстрая и легковесная утилита для создания скриншотов\nи видеозаписи экрана на Windows 10 / 11.", WS_CHILD | WS_VISIBLE, 25, 75, 430, 36, hWnd, NULL, g_hInstance, NULL);
+        SendMessageW(lblDesc, WM_SETFONT, (WPARAM)hTextFont, TRUE);
+
+        s_hChkAutostart = CreateWindowW(L"BUTTON", L"Разрешить автозагрузку (запуск вместе с Windows)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 25, 122, 430, 24, hWnd, (HMENU)301, g_hInstance, NULL);
+        SendMessageW(s_hChkAutostart, WM_SETFONT, (WPARAM)hTextFont, TRUE);
+        SendMessageW(s_hChkAutostart, BM_SETCHECK, BST_CHECKED, 0);
+
+        bool ffmpegInstalled = IsFFmpegInstalled();
+        std::wstring ffmpegText = ffmpegInstalled 
+            ? L"Установить FFmpeg (уже установлено)" 
+            : L"Установить FFmpeg (для видеозаписи со звуком)";
+
+        s_hChkFFmpeg = CreateWindowW(L"BUTTON", ffmpegText.c_str(), WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 25, 156, 430, 24, hWnd, (HMENU)302, g_hInstance, NULL);
+        SendMessageW(s_hChkFFmpeg, WM_SETFONT, (WPARAM)hTextFont, TRUE);
+        SendMessageW(s_hChkFFmpeg, BM_SETCHECK, BST_CHECKED, 0);
+
+        if (ffmpegInstalled) {
+            EnableWindow(s_hChkFFmpeg, FALSE);
+        }
+
+        s_hBtnInstall = CreateWindowW(L"BUTTON", L"Подтвердить установку", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 125, 215, 215, 38, hWnd, (HMENU)303, g_hInstance, NULL);
+        SendMessageW(s_hBtnInstall, WM_SETFONT, (WPARAM)hBoldFont, TRUE);
+
+        s_hBtnCancel = CreateWindowW(L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE, 350, 219, 95, 30, hWnd, (HMENU)304, g_hInstance, NULL);
+        SendMessageW(s_hBtnCancel, WM_SETFONT, (WPARAM)hTextFont, TRUE);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == 302) { // FFmpeg checkbox
+            if (IsFFmpegInstalled()) {
+                SendMessageW(s_hChkFFmpeg, BM_SETCHECK, BST_CHECKED, 0);
+            }
+        } else if (id == 303) { // Подтвердить установку
+            if (s_isDownloadingFFmpeg) return 0;
+
+            bool needFFmpeg = (!IsFFmpegInstalled() && (SendMessageW(s_hChkFFmpeg, BM_GETCHECK, 0, 0) == BST_CHECKED));
+
+            if (needFFmpeg) {
+                s_isDownloadingFFmpeg = true;
+                EnableWindow(s_hBtnInstall, FALSE);
+                EnableWindow(s_hBtnCancel, FALSE);
+                EnableWindow(s_hChkAutostart, FALSE);
+                EnableWindow(s_hChkFFmpeg, FALSE);
+                SetWindowTextW(s_hBtnInstall, L"⏳ Загрузка FFmpeg (0%)...");
+
+                InstallerDownloadParams* param = new InstallerDownloadParams{ hWnd, s_hBtnInstall };
+                CreateThread(NULL, 0, InstallerFFmpegDownloadThread, param, 0, NULL);
+            } else {
+                s_allowAutostart = (SendMessageW(s_hChkAutostart, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                s_installConfirmed = true;
+                DestroyWindow(hWnd);
+            }
+        } else if (id == 304) { // Отмена
+            if (s_isDownloadingFFmpeg) {
+                s_cancelInstallerDownload = true;
+            }
+            s_installConfirmed = false;
+            DestroyWindow(hWnd);
+        }
+        return 0;
+    }
+    case WM_INSTALLER_FFMPEG_DONE: {
+        s_isDownloadingFFmpeg = false;
+        bool ok = (wParam == 1);
+        if (ok) {
+            s_allowAutostart = (SendMessageW(s_hChkAutostart, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            s_installConfirmed = true;
+            DestroyWindow(hWnd);
+        } else {
+            int res = MessageBoxW(hWnd,
+                L"Не удалось скачать FFmpeg (проверьте подключение к Интернету).\n\n"
+                L"Продолжить установку WinScreen без FFmpeg?\n"
+                L"(Вы сможете установить FFmpeg позже в настройках программы)",
+                L"Загрузка FFmpeg", MB_YESNO | MB_ICONWARNING);
+            if (res == IDYES) {
+                s_allowAutostart = (SendMessageW(s_hChkAutostart, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                s_installConfirmed = true;
+                DestroyWindow(hWnd);
+            } else {
+                EnableWindow(s_hBtnInstall, TRUE);
+                EnableWindow(s_hBtnCancel, TRUE);
+                EnableWindow(s_hChkAutostart, TRUE);
+                EnableWindow(s_hChkFFmpeg, TRUE);
+                SetWindowTextW(s_hBtnInstall, L"Подтвердить установку");
+            }
+        }
+        return 0;
+    }
+    case WM_CLOSE: {
+        if (s_isDownloadingFFmpeg) {
+            s_cancelInstallerDownload = true;
+        }
+        s_installConfirmed = false;
+        DestroyWindow(hWnd);
+        return 0;
+    }
+    case WM_DESTROY: {
+        PostQuitMessage(0);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+bool ShowInstallerDialog(HINSTANCE hInstance, bool& outAutostart) {
+    s_installConfirmed = false;
+    s_allowAutostart = true;
+
+    WNDCLASSEXW wc = { sizeof(WNDCLASSEXW) };
+    wc.lpfnWndProc = InstallerWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"WinScreen_Installer";
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
+    RegisterClassExW(&wc);
+
+    int w = 480;
+    int h = 315;
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+
+    HWND hWnd = CreateWindowExW(
+        0,
+        wc.lpszClassName,
+        L"WinScreen — Установка",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
+        sx, sy, w, h,
+        NULL, NULL, hInstance, NULL
+    );
+
+    SetForegroundWindow(hWnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    UnregisterClassW(wc.lpszClassName, hInstance);
+    outAutostart = s_allowAutostart;
+    return s_installConfirmed;
 }
 
 void UninstallApp() {
@@ -1973,8 +2501,39 @@ void UninstallApp() {
         RegSetValueExW(hKey, REG_SNIP_KEY, 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
         RegCloseKey(hKey);
     }
-    MessageBoxW(NULL, L"WinScreen успешно удалён из автозагрузки Windows.", L"WinScreen", MB_OK | MB_ICONINFORMATION);
-    PostQuitMessage(0);
+
+    if (g_nid.hWnd) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    }
+
+    std::wstring installedExe = GetInstalledExePath();
+
+    MessageBoxW(NULL,
+        L"WinScreen успешно удалён из автозагрузки и системы.\n\n"
+        L"Файл настроек (settings.json) сохранён,\n"
+        L"чтобы ваши горячие клавиши и параметры не потерялись при будущей установке.",
+        L"WinScreen", MB_OK | MB_ICONINFORMATION);
+
+    // Гарантированное удаление исполняемого файла через bat-скрипт после выхода из процесса
+    std::wstring tempBat = GetAppDataDir() + L"\\_ws_uninstall.bat";
+    std::wofstream bat(tempBat);
+    if (bat.is_open()) {
+        bat << L"@echo off\n";
+        bat << L"chcp 65001 >nul\n";
+        bat << L"timeout /t 1 /nobreak >nul\n";
+        bat << L":retry\n";
+        bat << L"taskkill /f /im WinScreen.exe >nul 2>&1\n";
+        bat << L"del /f /q \"" << installedExe << L"\" >nul 2>&1\n";
+        bat << L"if exist \"" << installedExe << L"\" (\n";
+        bat << L"    timeout /t 1 /nobreak >nul\n";
+        bat << L"    goto retry\n";
+        bat << L")\n";
+        bat << L"del /f /q \"%~f0\" >nul 2>&1\n";
+        bat.close();
+        ShellExecuteW(NULL, L"open", tempBat.c_str(), NULL, NULL, SW_HIDE);
+    }
+
+    ExitProcess(0);
 }
 
 void OpenScreenshotsFolder() {
@@ -1982,10 +2541,14 @@ void OpenScreenshotsFolder() {
     ShellExecuteW(NULL, L"open", g_saveDir.c_str(), NULL, NULL, SW_SHOWNORMAL);
 }
 
-// Генерация значка трея в памяти
+// Генерация значка трея (из встроенных ресурсов или в памяти)
 HICON CreateTrayIcon() {
     int cx = GetSystemMetrics(SM_CXSMICON);
     int cy = GetSystemMetrics(SM_CYSMICON);
+
+    HICON hRes = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+    if (hRes) return hRes;
+
     HDC hdc = GetDC(NULL);
     HDC hMemDC = CreateCompatibleDC(hdc);
     HBITMAP hBmp = CreateCompatibleBitmap(hdc, cx, cy);
@@ -2048,16 +2611,6 @@ void ShowTrayMenu(HWND hWnd) {
     SetForegroundWindow(hWnd);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
     DestroyMenu(hMenu);
-}
-
-// Преобразование UTF-8 std::string в std::wstring
-inline std::wstring Utf8ToWide(const std::string& str) {
-    if (str.empty()) return L"";
-    int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.length(), NULL, 0);
-    if (sizeNeeded <= 0) return L"";
-    std::wstring wstr(sizeNeeded, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.length(), &wstr[0], sizeNeeded);
-    return wstr;
 }
 
 // Структура и логика проверки обновлений
@@ -2556,7 +3109,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             MessageBoxW(hWnd, L"Настройки успешно сохранены!", L"WinScreen", MB_OK | MB_ICONINFORMATION);
             DestroyWindow(hWnd);
         } else if (id == 103) { // Удалить
-            if (MessageBoxW(hWnd, L"Вы уверены, что хотите удалить WinScreen из автозагрузки?", L"Удаление WinScreen", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (MessageBoxW(hWnd, L"Вы уверены, что хотите полностью удалить WinScreen из системы?", L"Удаление WinScreen", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 UninstallApp();
             }
         } else if (id == 112) { // Кнопка GitHub
@@ -2664,6 +3217,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 void OpenSettingsDialog() {
     if (g_hSettingsWnd && IsWindow(g_hSettingsWnd)) {
+        ShowWindow(g_hSettingsWnd, SW_RESTORE);
         SetForegroundWindow(g_hSettingsWnd);
         return;
     }
@@ -2683,12 +3237,15 @@ void OpenSettingsDialog() {
     g_tempHkRecord = g_hkRecord;
 
     WNDCLASSEXW wc = { sizeof(WNDCLASSEXW) };
-    wc.lpfnWndProc = SettingsWndProc;
-    wc.hInstance = g_hInstance;
-    wc.lpszClassName = L"WinScreen_Settings";
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    RegisterClassExW(&wc);
+    if (!GetClassInfoExW(g_hInstance, L"WinScreen_Settings", &wc)) {
+        wc.lpfnWndProc = SettingsWndProc;
+        wc.hInstance = g_hInstance;
+        wc.lpszClassName = L"WinScreen_Settings";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(1));
+        RegisterClassExW(&wc);
+    }
 
     int w = 535, h = 580;
     int sx = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
@@ -2696,13 +3253,20 @@ void OpenSettingsDialog() {
 
     g_hSettingsWnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
-        wc.lpszClassName,
+        L"WinScreen_Settings",
         L"WinScreen — Настройки",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         sx, sy, w, h,
         NULL, NULL, g_hInstance, NULL
     );
-    SetForegroundWindow(g_hSettingsWnd);
+    if (g_hSettingsWnd) {
+        HICON hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+        if (hIcon) {
+            SendMessageW(g_hSettingsWnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+            SendMessageW(g_hSettingsWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+        }
+        SetForegroundWindow(g_hSettingsWnd);
+    }
 }
 
 // Главная процедура скрытого окна
@@ -2779,28 +3343,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
         UninstallApp();
         GdiplusShutdown(g_gdiplusToken);
         return 0;
-    } else if (cmd == L"--settings") {
-        OpenSettingsDialog();
-        MSG msg;
-        while (GetMessageW(&msg, NULL, 0, 0)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        GdiplusShutdown(g_gdiplusToken);
-        return 0;
     } else if (cmd == L"--help" || cmd == L"-h") {
         MessageBoxW(NULL,
             L"WinScreen — Параметры командной строки:\n\n"
             L"  --settings       Открыть графическое окно настроек\n"
             L"  --status         Показать текущую конфигурацию и горячие клавиши\n"
-            L"  --uninstall      Удалить из автозагрузки и системы\n\n"
-            L"Запуск без параметров автоматически активирует фоновую службу,\n"
-            L"перехват горячих клавиш и сворачивает программу в системный трей.",
+            L"  --uninstall      Удалить из автозагрузки и системы\n"
+            L"  --autostart      Фоновый запуск при старте Windows (сворачивание в трей)\n\n"
+            L"Запуск без параметров активирует службу скриншотов и сворачивает программу в системный трей.",
             L"WinScreen — Справка", MB_OK | MB_ICONINFORMATION);
         GdiplusShutdown(g_gdiplusToken);
         return 0;
     } else if (cmd == L"--status") {
-        std::wstring status = L"Текущая конфигурация WinScreen:\n\n"
+        std::wstring status = L"Текущая конфигурация WinScreen (v" + APP_VERSION + L"):\n\n"
             L"• Папка скриншотов: " + g_saveDir + L"\n"
             L"• Папка видеозаписей: " + g_videoSaveDir + L"\n"
             L"• Формат фото: " + g_fileFormat + L"\n"
@@ -2821,14 +3376,89 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
         return 0;
     }
 
-    // Автоматическая установка при первом старте
-    AutoInstallIfNeeded();
+    WCHAR currentExePath[MAX_PATH];
+    GetModuleFileNameW(NULL, currentExePath, MAX_PATH);
+
+    std::wstring installedExe = GetInstalledExePath();
+    bool isRunningInstalled = (_wcsicmp(currentExePath, installedExe.c_str()) == 0);
+    bool isInstalled = IsWinScreenInstalled();
+    std::wstring installedVer = GetInstalledVersion();
+
+    bool isAutostart = (cmd == L"--autostart" || cmd == L"--silent" || cmd == L"-s");
+    bool isExplicitSettings = (cmd == L"--settings");
+
+    if (!isRunningInstalled) {
+        // Запуск не из установленного расположения (%APPDATA%\WinScreen\WinScreen.exe)
+        if (!isInstalled) {
+            // Пункт 2: WinScreen еще не установлен в системе -> Показываем одноэтапный установщик
+            bool allowAutostart = true;
+            if (!ShowInstallerDialog(hInstance, allowAutostart)) {
+                // Пользователь отменил установку
+                GdiplusShutdown(g_gdiplusToken);
+                return 0;
+            }
+
+            // Установка подтверждена пользователем
+            if (!PerformInstallOrUpgrade(currentExePath, allowAutostart)) {
+                GdiplusShutdown(g_gdiplusToken);
+                return 1;
+            }
+
+            // После установки открываем настройки установленного WinScreen
+            ShellExecuteW(NULL, L"open", installedExe.c_str(), L"--settings", NULL, SW_SHOWNORMAL);
+            GdiplusShutdown(g_gdiplusToken);
+            return 0;
+        } else {
+            // WinScreen уже установлен в системе
+            int cmp = CompareVersions(APP_VERSION, installedVer);
+            if (cmp < 0) {
+                // Пункт 3: Попытка открыть более старую версию
+                std::wstring msg = L"WinScreen уже установлен в системе (версия v" + installedVer + L").\n\n"
+                    L"Вы пытаетесь открыть более старую версию (v" + APP_VERSION + L").\n"
+                    L"Установить старую версию без удаления текущей невозможно.\n\n"
+                    L"Для удаления текущей версии откройте Настройки WinScreen -> «Удалить из системы».";
+                MessageBoxW(NULL, msg.c_str(), L"WinScreen — Предупреждение", MB_OK | MB_ICONWARNING);
+                GdiplusShutdown(g_gdiplusToken);
+                return 0;
+            } else if (cmp == 0) {
+                // Пункт 4: Уже установлена та же версия -> просто открываются настройки
+                ShellExecuteW(NULL, L"open", installedExe.c_str(), L"--settings", NULL, SW_SHOWNORMAL);
+                GdiplusShutdown(g_gdiplusToken);
+                return 0;
+            } else {
+                // Пункт 5: Попытка открыть более новую версию -> предлагаем обновиться
+                std::wstring msg = L"Ваша текущая версия WinScreen v" + installedVer + L".\n"
+                    L"Вы пытаетесь открыть новую версию WinScreen v" + APP_VERSION + L".\n\n"
+                    L"Хотите обновиться?";
+                int res = MessageBoxW(NULL, msg.c_str(), L"WinScreen — Обновление", MB_YESNO | MB_ICONQUESTION);
+                if (res == IDYES) {
+                    bool keepAutostart = IsAutostartEnabled();
+                    if (!PerformInstallOrUpgrade(currentExePath, keepAutostart)) {
+                        GdiplusShutdown(g_gdiplusToken);
+                        return 1;
+                    }
+                    ShellExecuteW(NULL, L"open", installedExe.c_str(), L"--settings", NULL, SW_SHOWNORMAL);
+                    GdiplusShutdown(g_gdiplusToken);
+                    return 0;
+                } else {
+                    GdiplusShutdown(g_gdiplusToken);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // Если процесс выполняется из целевого каталога установки:
+    // Пункт 7: Гарантируем, что у WinScreen всегда ровно один процесс!
+    // При запуске нового процесса прошлые автоматически закрываются.
+    KillPreviousInstances();
 
     // Создание скрытого служебного окна
     WNDCLASSEXW wc = { sizeof(WNDCLASSEXW) };
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = L"WinScreen_Core";
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
     RegisterClassExW(&wc);
 
     g_hMainWnd = CreateWindowExW(
@@ -2848,6 +3478,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
 
     // Установка низкоуровневого хука клавиатуры (WH_KEYBOARD_LL)
     g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
+
+    // Если запуск не фоновый из автозагрузки (или запрошен --settings) -> открываем настройки
+    if (!isAutostart || isExplicitSettings) {
+        OpenSettingsDialog();
+    }
 
     // Фоновая проверка наличия обновлений при запуске
     std::thread([]() {

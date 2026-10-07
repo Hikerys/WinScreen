@@ -9,7 +9,7 @@ cd /d "%~dp0\.."
 
 pip install pyinstaller
 echo Сборка исполняемого файла WinScreen.exe...
-pyinstaller --noconsole --onefile --paths=src --distpath bin --workpath build --name WinScreen main.py
+pyinstaller --noconsole --onefile --paths=src --distpath bin --workpath build --icon=cpp/res/WinScreen.ico --name WinScreen main.py
 
 echo.
 echo =======================================================
