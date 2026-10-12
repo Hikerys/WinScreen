@@ -45,6 +45,6 @@
 
 <p align="center">
   <a href="https://tips.tips/ru/000487687">
-    <img src="https://img.shields.io/badge/%E2%9D%A4%EF%B8%8F%20%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C-tips.tips-orange?style=for-the-badge" alt="Поддержать проект">
+    <img src="https://img.shields.io/badge/%F0%9F%92%9A%20%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C-tips.tips-00fe86?style=for-the-badge" alt="Поддержать проект">
   </a>
 </p>
