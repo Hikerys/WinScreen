@@ -7,6 +7,7 @@
 import os
 import sys
 import json
+import platform
 import urllib.request
 import webbrowser
 import threading
@@ -17,9 +18,21 @@ from config import cfg, get_default_recordings_dir
 from autostart import is_autostart_enabled, set_autostart, uninstall
 from recorder import find_ffmpeg_executable, install_ffmpeg, get_audio_devices
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 GITHUB_REPO_URL = "https://github.com/Hikerys/WinScreen"
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/Hikerys/WinScreen/releases/latest"
+
+
+def is_arm_architecture():
+    cur_exe = os.path.basename(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).lower()
+    if "arm" in cur_exe or "aarch64" in cur_exe:
+        return True
+    mach = platform.machine().lower()
+    return "arm" in mach or "aarch64" in mach
+
+
+def get_target_exe_name():
+    return "WinScreen-ARM.exe" if is_arm_architecture() else "WinScreen.exe"
 
 
 def parse_version(v_str):
@@ -46,25 +59,53 @@ def check_for_updates():
     try:
         req = urllib.request.Request(
             GITHUB_API_LATEST_RELEASE,
-            headers={"User-Agent": "WinScreen-UpdateChecker/1.2.0"}
+            headers={"User-Agent": f"WinScreen-UpdateChecker/{APP_VERSION}"}
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             tag = data.get("tag_name", "")
             html_url = data.get("html_url", GITHUB_REPO_URL + "/releases/latest")
-            download_url = ""
+            
+            is_arm = is_arm_architecture()
+            arm_urls = []
+            x64_urls = []
             for asset in data.get("assets", []):
-                if asset.get("name", "").endswith(".exe"):
-                    download_url = asset.get("browser_download_url", "")
-                    break
-            if not download_url:
-                download_url = f"{GITHUB_REPO_URL}/releases/download/{tag}/WinScreen.exe"
+                name = asset.get("name", "").lower()
+                dl = asset.get("browser_download_url", "")
+                if name.endswith(".exe"):
+                    if "arm" in name or "aarch64" in name:
+                        arm_urls.append(dl)
+                    else:
+                        x64_urls.append(dl)
+
+            if is_arm:
+                download_url = ""
+                for u in arm_urls:
+                    if "winscreen-arm.exe" in u.lower():
+                        download_url = u
+                        break
+                if not download_url and arm_urls:
+                    download_url = arm_urls[0]
+                if not download_url:
+                    download_url = f"{GITHUB_REPO_URL}/releases/download/{tag}/WinScreen-ARM.exe"
+            else:
+                download_url = ""
+                for u in x64_urls:
+                    if "winscreen.exe" in u.lower() and "arm" not in u.lower():
+                        download_url = u
+                        break
+                if not download_url and x64_urls:
+                    download_url = x64_urls[0]
+                if not download_url:
+                    download_url = f"{GITHUB_REPO_URL}/releases/download/{tag}/WinScreen.exe"
+
             if tag and is_newer_version(tag, APP_VERSION):
                 return {
                     "has_update": True,
                     "latest_version": tag,
                     "release_url": html_url,
-                    "download_url": download_url
+                    "download_url": download_url,
+                    "is_arm": is_arm
                 }
     except Exception:
         pass

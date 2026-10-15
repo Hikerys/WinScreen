@@ -1,8 +1,8 @@
 1 ICON "WinScreen.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,2,0,0
-PRODUCTVERSION 1,2,0,0
+FILEVERSION 1,2,1,0
+PRODUCTVERSION 1,2,1,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -14,13 +14,22 @@ BEGIN
         BLOCK "041904b0"
         BEGIN
             VALUE "CompanyName", "Hikerys"
+#ifdef WINSCREEN_ARM64
+            VALUE "FileDescription", "WinScreen (ARM64)"
+            VALUE "FileVersion", "1.2.1.0"
+            VALUE "InternalName", "WinScreen-ARM"
+            VALUE "LegalCopyright", "Copyright (C) 2026"
+            VALUE "OriginalFilename", "WinScreen-ARM.exe"
+            VALUE "ProductName", "WinScreen (ARM64)"
+#else
             VALUE "FileDescription", "WinScreen"
-            VALUE "FileVersion", "1.2.0.0"
+            VALUE "FileVersion", "1.2.1.0"
             VALUE "InternalName", "WinScreen"
             VALUE "LegalCopyright", "Copyright (C) 2026"
             VALUE "OriginalFilename", "WinScreen.exe"
             VALUE "ProductName", "WinScreen"
-            VALUE "ProductVersion", "1.2.0.0"
+#endif
+            VALUE "ProductVersion", "1.2.1.0"
         END
     END
     BLOCK "VarFileInfo"

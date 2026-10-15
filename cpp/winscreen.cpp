@@ -49,9 +49,40 @@ using std::max;
 using namespace Gdiplus;
 
 // Версия и ссылки
-const std::wstring APP_VERSION = L"1.2.0";
+const std::wstring APP_VERSION = L"1.2.1";
 const std::wstring GITHUB_REPO_URL = L"https://github.com/Hikerys/WinScreen";
 const std::wstring GITHUB_API_LATEST_RELEASE = L"https://api.github.com/repos/Hikerys/WinScreen/releases/latest";
+
+// Архитектура и целевой исполняемый файл
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(WINSCREEN_ARM64)
+    #define IS_ARM64_BUILD 1
+    const std::wstring APP_ARCH = L"ARM64";
+    const std::wstring APP_TARGET_EXE = L"WinScreen-ARM.exe";
+#else
+    #define IS_ARM64_BUILD 0
+    const std::wstring APP_ARCH = L"x86_64";
+    const std::wstring APP_TARGET_EXE = L"WinScreen.exe";
+#endif
+
+inline bool IsArmBuild() {
+#if IS_ARM64_BUILD
+    return true;
+#else
+    WCHAR currentExePath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, currentExePath, MAX_PATH)) {
+        const WCHAR* pSlash = wcsrchr(currentExePath, L'\\');
+        const WCHAR* name = pSlash ? pSlash + 1 : currentExePath;
+        if (wcsstr(name, L"ARM") != NULL || wcsstr(name, L"arm") != NULL) {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
+inline std::wstring GetAppTargetExe() {
+    return IsArmBuild() ? L"WinScreen-ARM.exe" : L"WinScreen.exe";
+}
 
 // Константы приложения
 #define WM_TRAYICON (WM_USER + 1)
@@ -293,12 +324,16 @@ std::wstring GetLegacyJsonConfigFilePath() {
 }
 
 std::wstring GetInstalledExePath() {
-    return GetAppDataDir() + L"\\WinScreen.exe";
+    return GetAppDataDir() + L"\\" + GetAppTargetExe();
 }
 
 bool IsWinScreenInstalled() {
     std::wstring p = GetInstalledExePath();
     DWORD attr = GetFileAttributesW(p.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) return true;
+    // Проверяем альтернативный файл другой архитектуры на случай миграции
+    std::wstring alt = GetAppDataDir() + (IsArmBuild() ? L"\\WinScreen.exe" : L"\\WinScreen-ARM.exe");
+    attr = GetFileAttributesW(alt.c_str());
     return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
@@ -2229,6 +2264,7 @@ void KillPreviousInstances() {
             do {
                 if (pe.th32ProcessID != currentPid) {
                     bool match = (_wcsicmp(pe.szExeFile, L"WinScreen.exe") == 0) ||
+                                 (_wcsicmp(pe.szExeFile, L"WinScreen-ARM.exe") == 0) ||
                                  (_wcsicmp(pe.szExeFile, exeName) == 0);
                     if (match) {
                         HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
@@ -2269,6 +2305,11 @@ bool PerformInstallOrUpgrade(const std::wstring& currentExe, bool enableAutostar
                 L"\n\nПопробуйте закрыть другие программы и повторить попытку.";
             MessageBoxW(NULL, errText.c_str(), L"Ошибка установки", MB_OK | MB_ICONERROR);
             return false;
+        }
+        // Удаляем альтернативный исполняемый файл другой архитектуры при переходе/миграции
+        std::wstring altExe = appDir + (IsArmBuild() ? L"\\WinScreen.exe" : L"\\WinScreen-ARM.exe");
+        if (_wcsicmp(targetExe.c_str(), altExe.c_str()) != 0) {
+            DeleteFileW(altExe.c_str());
         }
     }
 
@@ -2523,7 +2564,10 @@ void UninstallApp() {
         bat << L"timeout /t 1 /nobreak >nul\n";
         bat << L":retry\n";
         bat << L"taskkill /f /im WinScreen.exe >nul 2>&1\n";
+        bat << L"taskkill /f /im WinScreen-ARM.exe >nul 2>&1\n";
         bat << L"del /f /q \"" << installedExe << L"\" >nul 2>&1\n";
+        std::wstring altExe = GetAppDataDir() + (IsArmBuild() ? L"\\WinScreen.exe" : L"\\WinScreen-ARM.exe");
+        bat << L"del /f /q \"" << altExe << L"\" >nul 2>&1\n";
         bat << L"if exist \"" << installedExe << L"\" (\n";
         bat << L"    timeout /t 1 /nobreak >nul\n";
         bat << L"    goto retry\n";
@@ -2685,9 +2729,12 @@ static std::wstring ExtractJsonString(const std::string& json, const std::string
     return L"";
 }
 
-static std::wstring ExtractExeDownloadUrl(const std::string& json) {
+static std::wstring ExtractExeDownloadUrl(const std::string& json, bool isArm) {
     std::string needle = "\"browser_download_url\"";
     size_t pos = 0;
+    std::vector<std::string> armUrls;
+    std::vector<std::string> x64Urls;
+
     while ((pos = json.find(needle, pos)) != std::string::npos) {
         pos += needle.length();
         while (pos < json.length() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) {
@@ -2699,10 +2746,41 @@ static std::wstring ExtractExeDownloadUrl(const std::string& json) {
             if (endPos != std::string::npos) {
                 std::string url = json.substr(pos, endPos - pos);
                 if (url.find(".exe") != std::string::npos) {
-                    return Utf8ToWide(url);
+                    size_t slashPos = url.rfind('/');
+                    std::string filename = (slashPos != std::string::npos) ? url.substr(slashPos + 1) : url;
+                    std::string lowerName = filename;
+                    for (char& c : lowerName) c = (char)tolower((unsigned char)c);
+
+                    if (lowerName.find("arm") != std::string::npos || lowerName.find("aarch64") != std::string::npos) {
+                        armUrls.push_back(url);
+                    } else {
+                        x64Urls.push_back(url);
+                    }
                 }
                 pos = endPos + 1;
             }
+        }
+    }
+
+    if (isArm) {
+        if (!armUrls.empty()) {
+            for (const auto& u : armUrls) {
+                std::string lower = u;
+                for (char& c : lower) c = (char)tolower((unsigned char)c);
+                if (lower.find("winscreen-arm.exe") != std::string::npos) return Utf8ToWide(u);
+            }
+            return Utf8ToWide(armUrls[0]);
+        }
+    } else {
+        if (!x64Urls.empty()) {
+            for (const auto& u : x64Urls) {
+                std::string lower = u;
+                for (char& c : lower) c = (char)tolower((unsigned char)c);
+                if (lower.find("winscreen.exe") != std::string::npos && lower.find("arm") == std::string::npos) {
+                    return Utf8ToWide(u);
+                }
+            }
+            return Utf8ToWide(x64Urls[0]);
         }
     }
     return L"";
@@ -2730,15 +2808,18 @@ static bool CheckForUpdates(UpdateInfo& outInfo) {
 
     if (json.empty()) return false;
 
+    bool isArm = IsArmBuild();
     std::wstring tagName = ExtractJsonString(json, "tag_name");
     std::wstring htmlUrl = ExtractJsonString(json, "html_url");
-    std::wstring downloadUrl = ExtractExeDownloadUrl(json);
+    std::wstring downloadUrl = ExtractExeDownloadUrl(json, isArm);
 
     if (tagName.empty()) return false;
 
+    std::wstring targetExe = isArm ? L"WinScreen-ARM.exe" : L"WinScreen.exe";
+
     outInfo.latestVersion = tagName;
     outInfo.releaseUrl = htmlUrl.empty() ? (GITHUB_REPO_URL + L"/releases/latest") : htmlUrl;
-    outInfo.downloadUrl = downloadUrl.empty() ? (GITHUB_REPO_URL + L"/releases/download/" + tagName + L"/WinScreen.exe") : downloadUrl;
+    outInfo.downloadUrl = downloadUrl.empty() ? (GITHUB_REPO_URL + L"/releases/download/" + tagName + L"/" + targetExe) : downloadUrl;
     outInfo.hasUpdate = IsNewerVersion(tagName, APP_VERSION);
 
     return true;
@@ -2953,7 +3034,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         SendMessageW(btnSave, WM_SETFONT, (WPARAM)hFont, TRUE);
 
         // 8. Подвал: версия, кнопка обновления и переход на GitHub
-        s_hLblVersion = CreateWindowW(L"STATIC", (L"WinScreen v" + APP_VERSION).c_str(), WS_CHILD | WS_VISIBLE, 20, 508, 140, 20, hWnd, NULL, g_hInstance, NULL);
+        std::wstring verLabel = L"WinScreen v" + APP_VERSION + (IsArmBuild() ? L" (ARM)" : L"");
+        s_hLblVersion = CreateWindowW(L"STATIC", verLabel.c_str(), WS_CHILD | WS_VISIBLE, 20, 508, 140, 20, hWnd, NULL, g_hInstance, NULL);
         SendMessageW(s_hLblVersion, WM_SETFONT, (WPARAM)hFont, TRUE);
 
         s_hBtnUpdate = CreateWindowW(L"BUTTON", L"🚀 Обновить", WS_CHILD, 165, 503, 180, 26, hWnd, (HMENU)113, g_hInstance, NULL);
